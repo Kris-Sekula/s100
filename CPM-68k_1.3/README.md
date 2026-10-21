@@ -102,7 +102,9 @@ A>SUBMIT MAKELDR      (BOOT.S + LBIOS.S -> CPMLDR.SYS)
 - **More RAM:** to use more memory, change `himem` in `BIOS.S` and the `-b` value in `MAKESYS.SUB` to the same new base address. Keep base + 9678h within your RAM.
 - **Boot tracks:** the boot tracks on these images already hold the new loader. `PUTBOOT.S` is CompuPro's generic source and hasn't been tested with this disk format, so make new boot disks by copying an image.
 
-## Testing done (68000 emulator)
+## Testing done 
+
+On 68000 emulator
 
 - **Full boot, S3-1 ON and OFF:**
   - path: Boot ROM 2.5, the DISK 1A boot routine, the 1.3 loader from the boot tracks, then `CPM.SYS`
@@ -113,6 +115,24 @@ A>SUBMIT MAKELDR      (BOOT.S + LBIOS.S -> CPMLDR.SYS)
 
 **Not tested:** the emulator has no DISK 3 or M-Drive/H model, so drives E:–I: and M: still need testing on the real hardware.
 
+Boots fine on a real CompuPro system
+
+```
+
+CP/M-68K(tm) Version 1.3  08/05/85
+Copyright (c) 1985 Digital Research, Inc.
+
+CompuPro CP/M-68K version 1.3J
+Copyright (c) 1983 CompuPro
+DISK3 controller does not respond
+
+A>dir
+A: CPM      SYS : CPMLDR   SYS : PIP      68K : STAT     68K : ED       68K
+A: DUMP     68K : SIZE68   68K : DDT      68K : DDT68000 68K : MFORM    68K
+A: FORMAT   68K : DISK3    68K : COPY     68K
+A>
+
+```
 ## Sources
 
 - **Digital Research CP/M-68K 1.3** (CPMLIB, LDRLIB, tools): taken from the 1.3 distribution files in Damian Wildie's cpm-68k project (github.com/dwildie/cpm-68k).
