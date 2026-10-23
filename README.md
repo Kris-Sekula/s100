@@ -238,24 +238,6 @@ Only a third-party CP/M 3 Disk-1 BIOS driver by Dick Lieber (22 May 1983). No Co
 
 A Feb–Mar 1982 CompuPro ad claims the 85/88 “runs MP/M II,” but no CompuPro manual or master turned up. Multi-user 8-bit was folded into MP/M 8-16 instead.
 
-## Using this file on GitHub
-
-Drop this file into a repository as `README.md` and GitHub will render it on the repo home page.
-
-What works on GitHub, and is used here:
-
-- Markdown headings, tables, links, blockquotes and GitHub alerts (`> [!NOTE]`, `> [!WARNING]`)
-- Embedded HTML for layout GitHub allows: `<div align="center">`, `<table>`, `<details>` / `<summary>`, `<strong>`, `<em>`
-- Relative links and images, anchors to headings, and task lists
-
-What GitHub strips or blocks, so it is **not** used here:
-
-- `<style>` blocks, CSS classes / IDs, and inline styling beyond simple alignment attributes
-- `<script>` and any JavaScript — so no live filter chips, search, or toggles beyond native `<details>`
-- `<iframe>`, forms, and external stylesheets
-
-If you need the fully interactive version — filter chips, styled cards, custom colours — keep the HTML page as the canonical version and link to it from this README, for example via GitHub Pages.
-
 ## Verification notes
 
 - bitsavers Compupro directories were re-listed live on 2026-10-23; file names above come from those listings. Note the case: `bits/Compupro/` (lowercase `p`); `bits/CompuPro/` 404s.
