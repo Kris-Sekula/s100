@@ -6,13 +6,6 @@
 
 *Every CompuPro-branded CP/M, sorted out: what was sold, what hardware it needed, and which boot disks survive today.*
 
-</div>
-
-> [!NOTE]
-> This is the GitHub version of the CompuPro CP/M Variants catalogue page. It is a single `README.md` file using GitHub-flavoured Markdown with embedded HTML where GitHub allows it — centred header, HTML tables, and collapsible `<details>` sections. GitHub strips `<style>`, `<script>`, CSS classes and JavaScript, so the interactive filter chips from the web page cannot run here; they are replaced below with static sections and tables that render natively on GitHub.
-
----
-
 ## Headlines
 
 - CompuPro genuinely sold **8 CP/M-family operating systems** for S-100: CP/M-80, CP/M-86, CP/M 8-16, MP/M-86, MP/M 8-16, Concurrent CP/M 8-16, Concurrent DOS 8-16, and CP/M-68K.
