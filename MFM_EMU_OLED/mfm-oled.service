@@ -1,0 +1,17 @@
+[Unit]
+Description=MFM emulator filename display (SSD1306 OLED on J7 I2C2)
+After=mfm_emu.service
+# Deliberately no Requires/Wants on mfm_emu: if the emulator is stopped
+# or the display is unplugged, this service must not drag anything else
+# down with it, and the emulator must never depend on the display.
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/mfm/oled/mfm_oled.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
