@@ -15,7 +15,7 @@ Run it as display only:
 
 Here is how to wire it ... buttons and LEDs are optional if you don't want to use them
 
-![Diagram]https://github.com/Kris-Sekula/s100/blob/main/MFM_EMU_OLED/Schematic_diagram.png)
+![Diagram](https://github.com/Kris-Sekula/s100/blob/main/MFM_EMU_OLED/Schematic_diagram.png)
 
 ## Dependencies: none beyond python3
 
