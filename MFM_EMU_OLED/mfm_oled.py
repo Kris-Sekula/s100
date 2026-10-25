@@ -61,6 +61,16 @@ service (with rollback if the new file does not come up). See the
 "Two-button file selection" section below for the full rules,
 including the service-only guard and the power-loss lockout.
 
+Screen saver (FlashFloppy-style, see the "Screen saver" section
+below): after 120 s with no button press and no content change,
+the display is blanked with the SSD1306 DISPLAY OFF command
+(0xAE) -- the panel goes dark but its framebuffer is kept, so
+DISPLAY ON (0xAF) restores the screen instantly. Any button press
+wakes it (that press is consumed by the wake, it does not also
+step the selection); a content change or a power loss also wakes
+it, so a POWER LOSS warning never sits on a dark screen.
+MFM_OLED_SCREENSAVER_SECONDS changes the timeout, 0 disables it.
+
 Usage:
   python3 mfm_oled.py                # daemon loop (what the service runs)
   python3 mfm_oled.py --once         # draw the current screen once, exit
@@ -673,6 +683,15 @@ class SSD1306(object):
             self._commands([0xB0 + page, 0x00, 0x10])  # page, column 0
             self._data(fb[page * WIDTH:(page + 1) * WIDTH])
 
+    def display_off(self):
+        # SSD1306 DISPLAY OFF (0xAE): the panel goes dark but the
+        # framebuffer RAM is kept, so display_on() restores the
+        # exact same screen instantly, with no redraw needed.
+        self._commands([0xAE])
+
+    def display_on(self):
+        self._commands([0xAF])
+
     def clear(self):
         self.display(bytearray(WIDTH * (HEIGHT // 8)))
 
@@ -1114,6 +1133,92 @@ def start_button_thread(events, stop_check):
     return thread
 
 
+# ---- Screen saver (FlashFloppy-style) -----------------------------------
+#
+# FlashFloppy's FF.CFG has display-off-secs (default 60): seconds of
+# inactivity before the display turns off, and display-on-activity
+# (default yes): the display wakes again on activity (track changes
+# and disk writes, or drive-select only with "sel"). The mechanism
+# there is described as turning off the LCD/OLED backlight; an
+# SSD1306 OLED has no backlight, so the equivalent here is the
+# controller's own DISPLAY OFF command (0xAE) -- the panel goes dark
+# while the framebuffer RAM is kept, and DISPLAY ON (0xAF) restores
+# the screen instantly with no redraw. That is what "blanking" means
+# in this daemon, not clearing the framebuffer.
+#
+# Differences from FlashFloppy, all deliberate:
+# - Timeout default is 120 s ("a couple of minutes", Kris's words),
+#   not FlashFloppy's 60 s. Env: MFM_OLED_SCREENSAVER_SECONDS, 0
+#   disables the saver entirely.
+# - Wake sources: any button press, any change in what the screen
+#   shows (file, Running/Idle, preview, swap result), and power
+#   loss, which always wakes the display -- a POWER LOSS warning
+#   must never sit on a dark screen. FlashFloppy's track/write
+#   wake has no equivalent here: mfm_emu exposes no track or write
+#   activity to userspace, so it cannot be a wake source, and the
+#   scrolling of a long filename is deliberately NOT activity
+#   (otherwise a long name would keep the screen lit forever).
+# - A button press that wakes the display is consumed by the wake
+#   alone: it does NOT also step the file selection. The next press
+#   after waking acts normally. Waking and accidentally swapping
+#   files in one press would be a nasty surprise.
+#
+# The saver never blanks while browsing, while a swap error is
+# shown, or while power loss is latched.
+
+SCREENSAVER_SECONDS = float(
+    os.environ.get("MFM_OLED_SCREENSAVER_SECONDS", "120"))
+
+
+class Screensaver(object):
+    """Idle-blank state machine. Pure logic, testable.
+
+    Times are monotonic seconds, supplied by the caller (the main
+    loop), so the class never touches the clock or the display.
+    """
+
+    def __init__(self, timeout):
+        self.timeout = timeout
+        self.blanked = False
+        self.last_activity = None
+
+    def start(self, now):
+        self.last_activity = now
+
+    def note_activity(self, now):
+        self.last_activity = now
+
+    def on_button(self, now):
+        """A button event arrived. True if it was consumed as a wake
+        (display was blanked); False if it is a normal press."""
+        if self.blanked:
+            self.blanked = False
+            self.last_activity = now
+            return True
+        self.last_activity = now
+        return False
+
+    def wake(self, now):
+        """Wake for a non-button reason (content change, power loss).
+        Returns True if the display was blanked."""
+        if self.blanked:
+            self.blanked = False
+            self.last_activity = now
+            return True
+        return False
+
+    def check_blank(self, now, inhibited):
+        """True when the display should be blanked right now."""
+        if self.timeout <= 0 or self.blanked or inhibited:
+            return False
+        if self.last_activity is None:
+            return False
+        if now - self.last_activity >= self.timeout:
+            self.blanked = True
+            return True
+        return False
+
+
 # ---- Main loop ----------------------------------------------------------
 
 _stop = False
@@ -1157,6 +1262,11 @@ def main(argv):
         start_button_thread(button_events, lambda: _stop)
     swap_error_until = 0.0
     swap_error_reason = None
+    # Screen saver: starts counting from daemon start; any button
+    # press, content change, or power-loss wake resets it.
+    screensaver = Screensaver(SCREENSAVER_SECONDS)
+    screensaver.start(time.monotonic())
+    wake_pending = False  # a wake happened; send DISPLAY ON on draw
     while not _stop:
         pairs, running, base_dir = current_files()
         voltage, _threshold, below = power_status()
@@ -1184,17 +1294,31 @@ def main(argv):
                 browse_dir = os.path.dirname(current_resolved) or None
             elif base_dir:
                 browse_dir = base_dir
+        events_this_tick = []
         while True:
             try:
-                direction = button_events.get_nowait()
+                events_this_tick.append(button_events.get_nowait())
             except queue.Empty:
                 break
-            if not power_loss:
-                browse_session.press(direction, current_resolved,
-                                     browse_dir, now)
+        if events_this_tick:
+            if screensaver.on_button(now):
+                # Display was blanked: this press only wakes it.
+                # The events are discarded, NOT fed to browsing,
+                # so waking can never accidentally swap files.
+                wake_pending = True
+                print("mfm-oled: display woken by button", flush=True)
+            elif not power_loss:
+                for direction in events_this_tick:
+                    browse_session.press(direction, current_resolved,
+                                         browse_dir, now)
         if power_loss:
             # Never browse or commit while the board is shutting down.
             browse_session.cancel()
+            if screensaver.wake(now):
+                # Power loss must never sit on a dark screen.
+                wake_pending = True
+                print("mfm-oled: display woken by power loss",
+                      flush=True)
         elif browse_session.anchor_changed(current_resolved):
             # The current file changed behind our back (external
             # restart, conf edit): drop the stale preview.
@@ -1232,12 +1356,21 @@ def main(argv):
             display_pairs, running, voltage, power_loss, base_dir,
             status_override)
         layout = (path_line, filename, status_line)
-        if layout != last_layout:
+        layout_changed = (layout != last_layout)
+        if layout_changed:
             # New file / state: restart the scroll from the beginning.
             last_layout = layout
             scroll_offset = 0
             scroll_phase = "hold_start"
             scroll_ticks = 0
+            last_key = None
+            screensaver.note_activity(now)
+        if screensaver.blanked and layout_changed:
+            # Content changed under a blank screen (file swapped
+            # externally, emulator stopped, swap failed): wake and
+            # redraw, so the new state is actually visible.
+            screensaver.wake(now)
+            wake_pending = True
             last_key = None
         max_offset = max(0, len(filename) - LARGE_CHARS)
         if max_offset == 0:
@@ -1265,6 +1398,11 @@ def main(argv):
             try:
                 device = open_display()
                 last_key = None  # force a redraw after reconnect
+                # Init leaves the display on: the saver restarts
+                # from here, and any pending wake is satisfied.
+                screensaver.blanked = False
+                screensaver.note_activity(now)
+                wake_pending = False
                 print("mfm-oled: display opened on %s at 0x%02x"
                       % (I2C_DEV, I2C_ADDR), flush=True)
             except Exception as exc:  # display absent/unplugged: keep trying
@@ -1273,8 +1411,13 @@ def main(argv):
                     return 1
                 time.sleep(RETRY_SECONDS)
                 continue
-        if key != last_key:
+        if not screensaver.blanked and (wake_pending or key != last_key):
             try:
+                if wake_pending:
+                    # DISPLAY ON first: without it the panel stays
+                    # dark even though the framebuffer is written.
+                    device.display_on()
+                    wake_pending = False
                 draw(device, display_pairs, running, scroll_offset,
                      voltage, power_loss, base_dir, status_override)
                 last_key = key
@@ -1287,10 +1430,28 @@ def main(argv):
             except Exception as exc:
                 print("mfm-oled: display write failed: %s" % exc, flush=True)
                 device = None
+                wake_pending = False
                 if once:
                     return 1
                 time.sleep(RETRY_SECONDS)
                 continue
+        # Screen saver: blank after SCREENSAVER_SECONDS of no button
+        # press and no content change, unless inhibited (browsing,
+        # swap error, or power loss). While blanked, the draw block
+        # above is skipped, so no I2C traffic reaches a dark panel.
+        inhibited = power_loss or browse_session.active \
+            or now < swap_error_until
+        if screensaver.check_blank(now, inhibited):
+            if device is not None:
+                try:
+                    device.display_off()
+                    print("mfm-oled: display blanked after %.0f s idle "
+                          "(screensaver)" % SCREENSAVER_SECONDS, flush=True)
+                except Exception as exc:
+                    print("mfm-oled: display blank failed: %s" % exc,
+                          flush=True)
+                    device = None
+                    screensaver.blanked = False
         if once:
             break
         time.sleep(TICK_SECONDS)
