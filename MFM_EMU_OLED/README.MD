@@ -163,6 +163,41 @@ Two buttons — file selection, FlashFloppy-style:
   never touches the display or the conf — only the main loop does.
   `--once` and `--dry-run` do not start the button thread.
 
+Screen saver — burn-in protection, FlashFloppy-style:
+
+FlashFloppy's `FF.CFG` has `display-off-secs` (default 60 s):
+seconds of inactivity before the display turns off, and
+`display-on-activity` (default `yes`): the display wakes again on
+activity. This daemon follows the same shape, adapted to the
+SSD1306 and to what `mfm_emu` exposes:
+
+- After 120 s with no button press and no change in what the
+  screen shows, the daemon sends the SSD1306 DISPLAY OFF command
+  (`0xAE`). The panel goes dark but its framebuffer RAM is kept,
+  so DISPLAY ON (`0xAF`) restores the exact same screen instantly
+  with no redraw. (An SSD1306 has no backlight to switch, so the
+  controller command is the equivalent of FlashFloppy's "backlight
+  off".) While blanked, the daemon also skips framebuffer writes,
+  so no I2C traffic reaches a dark panel.
+- Wake: press either button and the display comes back. That
+  press is consumed by the wake alone — it does NOT also step the
+  file selection, so waking can never accidentally swap files.
+  The next press after waking acts normally. A change in the
+  screen's content (file swapped externally, emulator stopped,
+  swap failed) also wakes it, and power loss always wakes it, so
+  `POWER LOSS - SHUTDOWN` never sits on a dark screen.
+- What does NOT count as activity: the scrolling of a long
+  filename (otherwise a long name would keep the screen lit
+  forever), and FlashFloppy's track/write wake, which has no
+  equivalent here — `mfm_emu` exposes no track or write activity
+  to userspace.
+- The saver never blanks while browsing, while a swap error is
+  shown, or while power loss is latched.
+- Timeout: `MFM_OLED_SCREENSAVER_SECONDS`, default `120`. Set it
+  to `0` to disable the saver entirely. The journal logs both
+  "display blanked after … s idle (screensaver)" and
+  "display woken by button" / "display woken by power loss".
+
 Preview the layout without a display:
 
 ```bash
