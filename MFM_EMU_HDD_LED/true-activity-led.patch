@@ -1,0 +1,201 @@
+diff --git a/emu/prucode0.p b/emu/prucode0.p
+index 9df8d03..b802286 100644
+--- a/emu/prucode0.p
++++ b/emu/prucode0.p
+@@ -276,6 +276,22 @@
+ #define DDR_ADDR     r23
+ // r24 and r25 used by subroutines and not restored
+ 
++   // --- True-activity LED patch (not in upstream) ---
++   // r6/r7/r13/r14/r15 are unused elsewhere in this file (verified by
++   // grep). r13/r14 hold the activity-LED state:
++   // ACT_TICKS: revolutions remaining before the LED is turned off.
++   //   Counted down once per revolution at end_track. Not a wall-clock
++   //   timer on purpose: both the cycle counter and the IEP counter are
++   //   reset by the seek/read/write paths, so neither is a free-running
++   //   clock. One revolution is 16.7 ms at 3600 RPM, 20 ms at 3000 RPM.
++   // ACT_LED_MASK: GPIO0 bit of the currently selected drive's LED
++   //   (1 << GPIO0_DRIVE0_LED or 1 << GPIO0_DRIVE1_LED), 0 = none.
++#define ACT_TICKS    r13
++#define ACT_LED_MASK r14
++   // Hold time in revolutions after the last activity event.
++   // 6 = ~100 ms at 3600 RPM, ~120 ms at 3000 RPM.
++#define ACT_HOLD_TICKS 6
++
+    // 100 nanoseconds, Settle time for head/select lines after change
+ #define SETTLE_TIME 20
+    // 250 microsecond max interval between step pulses for buffered seek
+@@ -390,6 +406,8 @@ START:
+    SBCO     RZERO, CONST_PRURAM, PRU_TEST4, 4
+    SBCO     RZERO, CONST_PRURAM, PRU0_ECAP_OVERRUN, 4
+    MOV      CUR_DRIVE_SEL, 0
++   MOV      ACT_TICKS, 0          // Activity LED off, no drive selected
++   MOV      ACT_LED_MASK, 0
+ 
+       // Set multiply only mode. Only needs to be done once
+    MOV      r25, 0                 
+@@ -728,6 +746,8 @@ loadit:
+    ADD      TRACK_BIT, TRACK_BIT, r3          // Update bit count
+    JMP      read
+ end_track:
++      // Once per revolution: age the activity LED hold timer
++   CALL     act_tick
+       // Starting a new track at the beginning. Reset time and counters to
+       // beginning.
+    MOV      TRACK_BIT, 0
+@@ -803,9 +823,11 @@ sel0_always:
+    // select
+    MOV      CUR_DRIVE_SEL, 20
+ sel0:
+-   // Turn on drive 0 select and LED and off drive 1
++   // Turn on drive 0 select and off drive 1 LED. Activity patch:
++   // the LED is not lit here; selected: below fires a timed
++   // activity pulse instead of the old steady select light.
+    SET      r30, R30_DRIVE0_SEL  
+-   MOV      r0, (1 << GPIO0_DRIVE1_SEL_RECOVERY) | (1 << GPIO0_DRIVE0_LED)
++   MOV      r0, (1 << GPIO0_DRIVE1_SEL_RECOVERY)
+    MOV      r1, GPIO0 | GPIO_CLEARDATAOUT
+    SBBO     r0, r1, 0, 4
+    MOV      r2, 0
+@@ -841,9 +863,7 @@ finish1:
+    SET      r30, R30_SEEK_COMPLETE_BIT 
+    SET      r30, R30_READY_BIT    
+    SBBO     r0, r1, 0, 4
+-   MOV      r0, (1 << GPIO0_DRIVE1_LED)
+-   MOV      r1, GPIO0 | GPIO_CLEARDATAOUT
+-   SBBO     r0, r1, 0, 4
++   MOV      ACT_LED_MASK, (1 << GPIO0_DRIVE1_LED)  // activity patch
+    JMP      selected
+ 
+ selected0:
+@@ -861,7 +881,10 @@ finish2:
+    MOV      r0, (1 << GPIO0_DRIVE1_LED)
+    MOV      r1, GPIO0 | GPIO_SETDATAOUT
+    SBBO     r0, r1, 0, 4
++   MOV      ACT_LED_MASK, (1 << GPIO0_DRIVE0_LED)  // activity patch
+ selected:
++   CALL     act_event             // activity patch: (re)selection counts
++                                  // as start of a read sequence
+ restart_lp:
+       // Prevent PRU0-PRU1 deadlock from unusual external signals
+    LBCO     r1, CONST_PRURAM, PRU0_EXIT, 4
+@@ -896,6 +919,8 @@ notsel:
+    SBBO     r0, r1, 0, 4
+    SBCO     RZERO, CONST_ECAP, CAP2, 4  // Turn off data
+    MOV      CUR_DRIVE_SEL, 0
++   MOV      ACT_TICKS, 0          // activity patch: deselected, LED off
++   MOV      ACT_LED_MASK, 0
+ 
+ waitsel:
+       // Check if we should exit
+@@ -1011,8 +1036,9 @@ step_restart:
+    SET      r30, R30_SEEK_COMPLETE_BIT 
+      // Cylinder of currently selected drive
+    LBBO     r3, DRIVE_DATA, PRU0_DRIVE0_CUR_CYL, 4
+-   // Turn on drive 1 select and LED and off drive 0
+-   MOV      r0, (1 << GPIO0_DRIVE1_LED)
++   // Turn on drive 1 select and off drive 0 LED. Activity patch:
++   // the LED is not lit here; selected: fires a timed pulse.
++   MOV      r0, 0
+    QBEQ     track0a, r3, 0
+    SET      r0, GPIO0_TRACK_0
+ track0a:
+@@ -1024,6 +1050,7 @@ track0a:
+ not_track0a:
+    MOV      r1, GPIO0 | GPIO_SETDATAOUT
+    SBBO     r0, r1, 0, 4
++   MOV      ACT_LED_MASK, (1 << GPIO0_DRIVE1_LED)  // activity patch
+    CLR      r30, R30_DRIVE0_SEL  
+    JMP      selected
+ selected0:
+@@ -1034,8 +1061,9 @@ selected0:
+    SET      r30, R30_SEEK_COMPLETE_BIT 
+      // Cylinder of currently selected drive
+    LBBO     r3, DRIVE_DATA, PRU0_DRIVE0_CUR_CYL, 4
+-   // Turn on drive 0 select and LED and off drive 1
+-   MOV      r0, (1 << GPIO0_DRIVE1_SEL_RECOVERY) | (1 << GPIO0_DRIVE0_LED)
++   // Turn on drive 0 select and off drive 1 LED. Activity patch:
++   // the LED is not lit here; selected: fires a timed pulse.
++   MOV      r0, (1 << GPIO0_DRIVE1_SEL_RECOVERY)
+    QBEQ     track0b, r3, 0
+    SET      r0, GPIO0_TRACK_0
+ track0b:
+@@ -1047,8 +1075,11 @@ track0b:
+ not_track0b:
+    MOV      r1, GPIO0 | GPIO_SETDATAOUT
+    SBBO     r0, r1, 0, 4
++   MOV      ACT_LED_MASK, (1 << GPIO0_DRIVE0_LED)  // activity patch
+    SET      r30, R30_DRIVE0_SEL  
+ selected:
++   CALL     act_event             // activity patch: (re)selection counts
++                                  // as start of a read sequence
+    XOUT     10, DRIVE_DATA, 4       // Send currently selected drive offset.
+       // We are selected so turn on selected signal
+       // If we are not waiting for a command start outputting MFM data else
+@@ -1072,6 +1103,8 @@ notsel:
+    SBBO     r0, r1, 0, 4
+    SBCO     RZERO, CONST_ECAP, CAP2, 4  // Turn off data
+    MOV      CUR_DRIVE_SEL, 0
++   MOV      ACT_TICKS, 0          // activity patch: deselected, LED off
++   MOV      ACT_LED_MASK, 0
+ 
+ waitsel:
+       // Check if we should exit
+@@ -1120,6 +1153,7 @@ handle_cyl_change:
+       // direction signal. After we have final cylinder we tell the ARM to
+       // get us the cylinder data. 
+ step:
++   CALL     act_event             // activity patch: seek step
+    SBCO     RZERO, CONST_ECAP, CAP2, 4        // Turn off data
+    CLR      r30, R30_SEEK_COMPLETE_BIT        // Indicate seek in progress
+ 
+@@ -1335,6 +1369,38 @@ settrack0:
+    RET
+ #endif
+ 
++      // --- True-activity LED helpers (patch) ---
++      // Leaf routines: clobber r0/r1 only, call no other routine.
++      // All call sites are in top-level flow (branched/fallen into,
++      // never inside another CALLed routine), so r29 is free.
++      //
++      // Activity events: (re)selection / head change (via selected:),
++      // a step pulse (via step:), and write gate (via write:).
++      // ST-506/MFM has no read gate from the controller, so a pure
++      // streaming read with no control-line change cannot be told
++      // apart from idle spinning -- see act_tick.
++act_event:
++   QBEQ     act_event_ret, ACT_LED_MASK, 0   // No drive, nothing to light
++   MOV      ACT_TICKS, ACT_HOLD_TICKS        // (Re)start the hold timer
++   MOV      r0, ACT_LED_MASK
++   MOV      r1, GPIO0 | GPIO_CLEARDATAOUT    // Active low: on
++   SBBO     r0, r1, 0, 4
++act_event_ret:
++   RET
++
++      // Called once per revolution from end_track. While a write or a
++      // seek is in progress end_track is not reached, so the LED simply
++      // stays on for the duration -- which is the desired behaviour.
++act_tick:
++   QBEQ     act_tick_ret, ACT_TICKS, 0
++   SUB      ACT_TICKS, ACT_TICKS, 1
++   QBNE     act_tick_ret, ACT_TICKS, 0
++   MOV      r0, (1 << GPIO0_DRIVE0_LED) | (1 << GPIO0_DRIVE1_LED)
++   MOV      r1, GPIO0 | GPIO_SETDATAOUT      // Active low: both off
++   SBBO     r0, r1, 0, 4
++act_tick_ret:
++   RET
++
+ // Get select and head value
+ // Returns PRU0_CUR_SELECT_HEAD in r24. For REVC PRU0_CUR_SELECT_HEAD is
+ // only head. Select written to PRU0_R31. PRU0_CUR_HEAD also updated with
+@@ -1375,6 +1441,10 @@ storeh1:
+       // Capture write data from the controller.
+       // We switch the ECAP from PWM mode to capture mode
+ write:
++   CALL     act_event             // activity patch: write gate active.
++                                  // LED then stays on for the whole write:
++                                  // act_tick only runs at end_track, which
++                                  // the write capture loop never reaches.
+    XOUT     10, TRACK_BIT, 4        // Send current bit count.
+ SBCO TRACK_BIT, CONST_PRURAM, 0xe0, 4
+ LBBO     r0, CYCLE_CNTR, 0, 4     // Get time
