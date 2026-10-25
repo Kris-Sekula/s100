@@ -5,6 +5,16 @@ emulated on a 0.96" I2C OLED. It does not modify `mfm_emu`, the PRU code,
 or any emulation file, so a missing or dead display cannot affect
 emulation.
 
+Run it as display only:
+
+![Display](https://github.com/Kris-Sekula/s100/blob/main/MFM_EMU_OLED/OLED_ONLY.jpg)
+
+... or with navigation buttons and HDD LED
+
+![DisplayPlus](https://github.com/Kris-Sekula/s100/blob/main/MFM_EMU_OLED/OLED_SW_LED.jpg)
+
+
+
 ## Dependencies: none beyond python3
 
 The daemon uses **only the Python standard library**: raw `/dev/i2c-*`
