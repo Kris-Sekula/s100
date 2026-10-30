@@ -7,6 +7,10 @@ also serving a small web UI: upload disk images over Wi-Fi, select which image
 the Gotek mounts, and see at a glance what is currently presented — all without
 touching the machine, pulling the stick, or walking across the room.
 
+Simply insert into your Gotek drive and control remotly
+
+![In action](https://github.com/Kris-Sekula/s100/blob/main/flashfloppy_remote_usb/remote_usb.jpg)
+
 The board's own LCD shows the selected file name, the Wi-Fi network, and the
 IP address.
 
@@ -112,6 +116,8 @@ is shown on the LCD and printed in the serial log; the web UI is then at
 `http://<that-address>/`.
 
 ## Using the web UI
+
+![UI](https://github.com/Kris-Sekula/s100/blob/main/flashfloppy_remote_usb/ui.jpg)
 
 **Status line** — `Presented: <file> | state: <state> | staged: <n> | wifi: <mode> <address>`.
 It refreshes automatically every 2 seconds, so it follows selections,
