@@ -1,0 +1,24 @@
+CONFIG_IDF_TARGET_ESP32S3=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_TINYUSB_MSC_ENABLED=y
+# Local mount point used by the MSC storage component during local
+# windows (v15 whole-card design); must match FF_SD_MOUNT_POINT.
+CONFIG_TINYUSB_MSC_MOUNT_PATH="/sdcard"
+CONFIG_TINYUSB_CDC_ENABLED=n
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255
+
+# Console on the header UART (UART0 remapped: TX = IO3, RX = IO2, the
+# BOARD_UART pins in board.h). Since v02 the app installs TinyUSB, and
+# the ESP32-S3's USB-OTG and USB-Serial-JTAG controllers share the one
+# internal USB PHY, so the USB serial console cannot stay alive once
+# TinyUSB owns the port. Logs therefore move to the header pins; use a
+# 3.3 V USB-UART adapter (adapter TX -> board RXD/IO2, adapter RX ->
+# board TXD/IO3, GND -> GND) at 115200.
+# NOTE: sdkconfig.defaults only applies when there is no sdkconfig yet.
+# Delete the project's sdkconfig file once so these take effect.
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+CONFIG_ESP_CONSOLE_UART_CUSTOM_NUM_0=y
+CONFIG_ESP_CONSOLE_UART_CUSTOM_TX_GPIO=3
+CONFIG_ESP_CONSOLE_UART_CUSTOM_RX_GPIO=2
