@@ -25,14 +25,19 @@ IP address.
   buttons/rotary encoder stay in agreement.
 - **Gotek-side changes are picked up live** — if you change image with the
   Gotek's buttons, the web UI and LCD follow within a few seconds.
-- **Staged uploads** — files uploaded over Wi-Fi are held in RAM and written
-  to the card at the next safe moment (see *How it works*), so an upload never
-  fights the Gotek for the filesystem.
+- **Direct uploads while ejected** — eject the drive and uploads stream
+  straight to the card over Wi-Fi, any size the card can hold; an upload
+  never fights the Gotek for the filesystem because the Gotek doesn't
+  have it at the time.
 - **LCD status display** — selected file name in large type, plus SSID and IP
   address, on the board's 1.47" colour LCD.
 - **Your configs stay yours** — your `FF.CFG` / `IMG.CFG` are used as-is; the
   firmware only guarantees the one setting selection depends on
   (`image-on-startup = last`), creating `FF.CFG` with it if none exists.
+- **Machine power control** — optionally switch the host machine's power
+  from the same UI via a TP-Link Kasa strip/plug (e.g. HS300), including a
+  one-click restart, an automatic restart right after an image swap, and a
+  live power-draw readout.
 
 ## Hardware
 
@@ -80,6 +85,7 @@ just like a normal FlashFloppy stick:
 /IMG.CFG       (optional)
 /IMAGE_A.CFG   (written by FlashFloppy / this device — don't edit by hand)
 /WIFI.CFG      (optional — see below)
+/POWER.CFG     (optional — see below)
 *.hfe, *.img, *.adf, ...   your disk images
 ```
 
@@ -115,17 +121,51 @@ Once joined, the device takes a DHCP address from your router. The address
 is shown on the LCD and printed in the serial log; the web UI is then at
 `http://<that-address>/`.
 
+## Controlling machine power (optional)
+
+If the host machine is powered through a TP-Link Kasa smart strip
+(HS300 and relatives) or plug on the same LAN, the web UI can switch
+that outlet too — handy for rebooting the machine into a freshly
+swapped image. Create **`POWER.CFG`** in the root of the SD card:
+
+```ini
+host=192.168.0.16
+outlet=1
+delay=5
+name=Machine
+```
+
+| Key | Values | Meaning |
+|---|---|---|
+| `host` | IP or hostname of the Kasa device | Required |
+| `port` | default `9999` | Kasa local-API port |
+| `outlet` | 1-based outlet number (default `1`) | Which strip outlet feeds the machine; ignored for single-socket plugs |
+| `delay` | seconds (default `5`) | Pause between off and on for Restart |
+| `name` | label (default `Machine`) | Shown in the UI |
+
+The device's **Machine power** section appears in the UI only when
+`POWER.CFG` exists on the card. It uses the Kasa *local* API (TCP 9999) — no TP-Link
+cloud account is involved, and the strip and this device must be on the
+same network. Tick **restart machine after swap** next to the Select
+button to power-cycle the machine automatically once a swap completes.
+While running, the device also re-reads the outlet every 5 seconds
+(relay state and power draw), so the UI shows live watts and follows
+changes made elsewhere — the Kasa app, another client, or the strip's
+physical buttons.
+
 ## Using the web UI
 
 ![UI](https://github.com/Kris-Sekula/s100/blob/main/flashfloppy_remote_usb/ui.jpg)
 
-**Status line** — `Presented: <file> | state: <state> | staged: <n> | wifi: <mode> <address>`.
+**Status line** — `Presented: <file> | state: <state> | drive ejected/presented | wifi: <mode> <address>`.
 It refreshes automatically every 2 seconds, so it follows selections,
 eject/re-insert cycles, and Gotek-side changes on its own.
 
 **Library list** — every file on the card, grouped: disk images first,
-backups (`.bak`) next, config files (`FF.CFG`, `IMG.CFG`) last. Staged
-uploads are marked `[staged - not on card yet]`.
+backups (`.bak`) next. Config files (`FF.CFG`, `IMG.CFG`, `POWER.CFG`)
+appear in their own **Config Files** section at the bottom — listed
+for reference, never selectable as images. Sizes are shown in short
+human form (`626k`, `3.23M`).
 
 **Selecting an image**
 
@@ -138,17 +178,31 @@ physical stick — and FlashFloppy mounts the chosen image.
 
 **Uploading**
 
-Choose a file and click **Upload**. The file is staged in the device's RAM
-(up to 7 MB across 4 files) and written to the card at the next
-*local window*: the next Select, **Re-insert card**, or **Eject**.
-`FF.CFG` and `IMG.CFG` may be uploaded (they land in the root);
-`IMAGE_A.CFG` is refused, because FlashFloppy owns it.
+Uploads write directly to the card, so the drive must be **ejected**
+first — the Upload button is greyed out until it is, and the hint
+under it says which state you're in. Click **Eject**, choose a file,
+click **Upload**: the file streams to the card at whatever size it
+is (the only limit is free space), with a progress bar and percentage
+while it transfers, and **Done** beside the button when it lands; the
+new file appears in the library list straight away. Uploads go to a
+temporary name first and are renamed into place only on a clean
+finish, so an interrupted transfer never leaves a partial file
+behind. When you're done, **Re-insert card** hands the drive back
+to the Gotek.
+`FF.CFG` and `IMG.CFG` may be uploaded; `IMAGE_A.CFG` is refused,
+because FlashFloppy owns it.
 
-**Re-insert card (apply uploads)** — runs a disconnect/edit/reconnect
-cycle without changing the selection. Use it to land staged uploads.
+**Re-insert card** — runs a disconnect/edit/reconnect cycle without
+changing the selection, and hands the card back after an eject.
 
 **Eject** — disconnects the card and leaves it disconnected (the host
-sees an empty drive) until the next Select or Re-insert.
+sees an empty drive) until the next Select or Re-insert. This is
+also the state uploads happen in.
+
+**Machine power** (only when `POWER.CFG` exists on the card) — shows the
+outlet's live state and power draw with **Power on**, **Power off**, and
+**Restart** buttons. Restart turns the outlet off, waits the configured
+delay, and turns it back on.
 
 **LCD** — shows the presented file name, SSID, and IP address, updated on
 every change, including selections made on the Gotek itself.
@@ -164,9 +218,14 @@ card.
 When something needs to change, the firmware opens a short **local
 window**: it fully detaches USB (the host sees a genuine unplug),
 mounts the card locally, applies the change — write `IMAGE_A.CFG`,
-flush staged uploads, refresh its view — then unmounts and re-attaches.
+refresh its view — then unmounts and re-attaches.
 With `image-on-startup = last`, FlashFloppy reads `IMAGE_A.CFG` on the
 fresh insertion and mounts the named image.
+
+Uploads use the same ownership rule from the other side: **Eject**
+leaves the card detached and locally mounted, and in that state an
+upload streams straight to the card — no intermediary, no size limit
+but free space. Re-insert hands the card back when you're done.
 
 Because reading is not writing, one exception is safe: a background task
 polls `IMAGE_A.CFG` every few seconds by reading raw sectors (never
@@ -180,9 +239,10 @@ the card is the single source of truth, whichever side changed it last.
 
 - **No authentication on the web UI.** Run it on a trusted LAN only;
   don't port-forward it.
-- Uploads are limited by the RAM staging area: **7 MB total, up to 4
-  files**, flushed at the next local window. For larger files, load
-  them onto the card in a PC — it's just a normal stick.
+- Uploads require the drive to be **ejected** (they write directly
+  to the card while it is detached; see *Uploading* above). File
+  size is limited only by free card space and FAT32's 4 GiB
+  per-file ceiling.
 - `FF.CFG` is expected in the card root (the `FF/` subfolder layout is
   not used).
 - Works with images in the card root; subfolders are visible to
@@ -194,14 +254,14 @@ the card is the single source of truth, whichever side changed it last.
 main/
   main.c         boot, Wi-Fi (AP / station), apply task, peek task
   sdcard.c       SDMMC init, USB install, local-window mount switching
-  storage.c      card snapshot, IMAGE_A.CFG read/write, upload staging,
-                 raw-sector peek
+  storage.c      card snapshot, IMAGE_A.CFG read/write, direct
+                 streaming upload, raw-sector peek
   http_server.c  REST API (/api/status, /api/library, /api/select, ...)
   web_ui.h       the embedded web page
   lcd.c          ST7789 status display
+  power.c        TP-Link Kasa outlet control (POWER.CFG)
   font.h         generated 10x18 font (DejaVu Sans Mono)
   state.c/h      shared state
   board.h        pin map and tunables
 ```
 
-Development history is in [CHANGELOG.md](CHANGELOG.md).
