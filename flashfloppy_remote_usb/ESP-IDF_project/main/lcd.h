@@ -1,4 +1,5 @@
 #pragma once
+#include <stdbool.h>
 #include "esp_err.h"
 
 /* ST7789 status display (driver since v23; a no-op stub before).
@@ -8,3 +9,9 @@
  * Wi-Fi SSID and IP address from g_ff (wifi_ssid / wifi_ip). */
 esp_err_t ff_lcd_init(void);
 void ff_lcd_show_status(const char *line1, const char *line2);
+
+/* Screensaver blanking (v42): blank = panel display off +
+ * backlight off. The framebuffer and the panel's own GRAM are
+ * kept, so unblanking is instant and shows the last frame. */
+void ff_lcd_set_blank(bool blank);
+bool ff_lcd_is_blanked(void);

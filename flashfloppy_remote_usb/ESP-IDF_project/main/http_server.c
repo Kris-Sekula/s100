@@ -153,6 +153,32 @@ static esp_err_t request_window(httpd_req_t *req, const char *pending,
     return send_json(req, "{\"ok\":true}");
 }
 
+/* v42: non-HTTP twin of request_window() for the button task —
+ * the same claim checks and field sequence, with no response to
+ * send. Kept beside request_window so the two cannot drift. */
+bool ff_request_select(const char *name)
+{
+    ff_state_lock();
+    bool ok = !g_ff.upload_active &&
+              g_ff.state != FF_STATE_SWAP_PENDING &&
+              g_ff.state != FF_STATE_DISCONNECTED &&
+              g_ff.state != FF_STATE_APPLYING;
+    if (ok) {
+        snprintf(g_ff.pending_path, sizeof(g_ff.pending_path), "%s",
+                 name);
+        g_ff.eject_requested = false;
+        g_ff.restart_after_swap = false;
+        g_ff.force_swap = false;
+        g_ff.waiting_usb = false;
+        g_ff.pending_since_ms = ff_now_ms();
+        g_ff.last_error[0] = 0; /* a new request starts clean */
+        g_ff.state = FF_STATE_SWAP_PENDING;
+    }
+    ff_state_unlock();
+    if (ok) ff_apply_kick();
+    return ok;
+}
+
 static esp_err_t h_select(httpd_req_t *req)
 {
     char body[384];

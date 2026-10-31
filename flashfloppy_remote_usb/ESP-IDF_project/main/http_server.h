@@ -1,9 +1,16 @@
 #pragma once
+#include <stdbool.h>
 #include "esp_err.h"
 
 /* HTTP API. Handlers only REQUEST state transitions; the swap task in
  * main.c owns the disconnect/build/reconnect sequence. */
 esp_err_t ff_http_start(void);
+
+/* Queue a select exactly as POST /api/select does, for callers
+ * that are not HTTP handlers (the BOOT-button task, v42). Returns
+ * false when a window is already queued/running or an upload is
+ * streaming. */
+bool ff_request_select(const char *name);
 
 /* API surface:
  *   GET  /                embedded web UI (web_ui.h)

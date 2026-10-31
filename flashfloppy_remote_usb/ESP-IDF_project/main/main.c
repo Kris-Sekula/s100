@@ -5,6 +5,7 @@
 #include "power.h"
 #include "http_server.h"
 #include "lcd.h"
+#include "button.h"
 #include "util.h"
 #include <stdio.h>  /* snprintf() */
 #include <stdlib.h> /* atoi() for the POWER.CFG parser */
@@ -515,5 +516,8 @@ void app_main(void)
      * background; v39: plus the command worker (no-op when
      * POWER.CFG is absent). */
     ff_power_start();
+    /* v42: BOOT-button browsing + the LCD screensaver. Started
+     * last: it reads the snapshot and the LCD from its own task. */
+    ff_button_start();
     ESP_LOGI(TAG, "FlashFloppy ESP32 frontend up (whole-card design)");
 }

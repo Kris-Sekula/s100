@@ -31,6 +31,10 @@ IP address.
   have it at the time.
 - **LCD status display** — selected file name in large type, plus SSID and IP
   address, on the board's 1.47" colour LCD.
+- **BOOT-button browsing** — tap the board's BOOT button to preview
+  the next image on the LCD, FlashFloppy-style; stop pressing for
+  2 seconds and the previewed image is swapped in. The LCD blanks
+  after 2 idle minutes; any press wakes it.
 - **Your configs stay yours** — your `FF.CFG` / `IMG.CFG` are used as-is; the
   firmware only guarantees the one setting selection depends on
   (`image-on-startup = last`), creating `FF.CFG` with it if none exists.
@@ -57,6 +61,7 @@ Pin usage is fixed by the board (defined in `main/board.h`):
 | SD card (SDMMC 4-bit) | CLK 14, CMD 15, D0 16, D1 18, D2 17, D3 21 |
 | LCD (SPI) | RST 39, CLK 40, DC 41, CS 42, DIN 45, backlight 48 |
 | Debug UART (header) | RX 2, TX 3 |
+| BOOT button | GPIO0 |
 
 ## Building and flashing
 
@@ -231,6 +236,36 @@ a failed command shows in red under the power state.
 **LCD** — shows the presented file name, SSID, and IP address, updated on
 every change, including selections made on the Gotek itself.
 
+## Using the BOOT button
+
+The board's BOOT button works the way FlashFloppy's own button
+does. While the drive is presented, each press **previews** the
+next image in the library on the LCD — the name in large type,
+with a `Preview n/m` counter — without disturbing the Gotek.
+Keep pressing (or hold the button down to step repeatedly) until
+the image you want is showing, then stop: after **2 seconds**
+with no further press, the previewed image is selected through
+the same swap path as the web UI, including the wait for the
+drive to go quiet. A selection from the web UI, or a change made
+on the Gotek itself, cancels a preview in progress. Forward
+only, wrapping from the last image back to the first.
+
+While the drive is **ejected**, presses do nothing — the
+ejected/upload state owns the card then.
+
+The button also drives the **screensaver**: the LCD blanks
+after 2 minutes with no activity (no presses, no selection
+changes, no swaps). Any press wakes it — and a press that wakes
+the screen is spent on waking; it does not also step the
+preview. A selection change while the screen is blank wakes it
+too, to show the new name.
+
+One caution: BOOT is a strapping pin. It is only sampled at
+reset — don't hold it while powering up or resetting the board,
+or the chip boots its download loader instead of this firmware.
+All button timings (`FF_PREVIEW_COMMIT_MS`,
+`FF_LCD_SCREENSAVER_MS`, debounce and repeat) are in `board.h`.
+
 ## How it works
 
 A USB stick has exactly one owner at a time, and this design keeps it
@@ -291,6 +326,7 @@ main/
   font.h         generated 10x18 font (DejaVu Sans Mono)
   state.c/h      shared state
   util.c/h       small shared helpers (string copy, NVS record, clock)
+  button.c       BOOT-button browsing + LCD screensaver (v42)
   board.h        pin map and tunables
 ```
 

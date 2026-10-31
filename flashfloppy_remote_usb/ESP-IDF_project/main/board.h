@@ -30,6 +30,13 @@
 
 #define BOARD_RGB_GPIO 38
 
+/* BOOT button (v42): the board's strapping button on GPIO0. The
+ * ROM samples it only at reset; while the app runs it is a free
+ * input (button to GND, internal pull-up). Do not hold it while
+ * powering up or resetting — that boots the download loader
+ * instead of the app. Polled by the button task (button.c). */
+#define BOARD_BOOT_GPIO 0
+
 /* Paths on the SD card (mounted at /sdcard by the storage layer
  * during local windows; while the card is exposed to USB the ESP32
  * must not touch these paths at all — v15 whole-card design).
@@ -86,5 +93,21 @@
 /* How often the power module re-reads the outlet (state + watts)
  * in the background (v36, Kris's ask: catch flips made elsewhere). */
 #define FF_POWER_POLL_MS 5000
+
+/* BOOT button behaviour (v42, FlashFloppy-style browsing): a press
+ * previews the next image on the LCD; the preview commits through
+ * the normal select path after FF_PREVIEW_COMMIT_MS with no
+ * further press. Holding the button auto-repeats after
+ * FF_BUTTON_HOLD_MS. The LCD blanks after FF_LCD_SCREENSAVER_MS
+ * with no activity (button press, selection change, swap) and any
+ * press wakes it; 0 disables the screensaver. Polled, not
+ * interrupt-driven: the poll task also runs the commit timer and
+ * the screensaver, and 20 ms granularity is plenty for a button. */
+#define FF_BUTTON_POLL_MS 20
+#define FF_BUTTON_DEBOUNCE_MS 30
+#define FF_BUTTON_HOLD_MS 600
+#define FF_BUTTON_REPEAT_MS 150
+#define FF_PREVIEW_COMMIT_MS 2000
+#define FF_LCD_SCREENSAVER_MS 120000
 #define FF_WIFI_SSID "FlashFloppy"
 #define FF_WIFI_PASS "flashfloppy"

@@ -48,6 +48,7 @@ static uint16_t *s_fb; /* PSRAM framebuffer, RGB565 byte-swapped */
  * s_fb before the framebuffer is overwritten. */
 static SemaphoreHandle_t s_lcd_lock;
 static SemaphoreHandle_t s_flush_done;
+static bool s_blanked; /* screensaver state (v42) */
 
 static bool flush_done_cb(esp_lcd_panel_io_handle_t io,
                           esp_lcd_panel_io_event_data_t *edata,
@@ -228,4 +229,25 @@ void ff_lcd_show_status(const char *line1, const char *line2)
      * footer from g_ff. Safe from any task since v39 (see
      * s_lcd_lock); must not be called with ff_state_lock held. */
     render(line1, line2);
+}
+
+void ff_lcd_set_blank(bool blank)
+{
+    if (!s_panel || !s_lcd_lock || blank == s_blanked) return;
+    /* Serialised with render(): a frame may be mid-DMA. */
+    xSemaphoreTake(s_lcd_lock, portMAX_DELAY);
+    s_blanked = blank;
+    if (blank) {
+        esp_lcd_panel_disp_on_off(s_panel, false);
+        gpio_set_level(BOARD_LCD_BL_GPIO, 0);
+    } else {
+        esp_lcd_panel_disp_on_off(s_panel, true);
+        gpio_set_level(BOARD_LCD_BL_GPIO, 1);
+    }
+    xSemaphoreGive(s_lcd_lock);
+}
+
+bool ff_lcd_is_blanked(void)
+{
+    return s_blanked;
 }
