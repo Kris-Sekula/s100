@@ -43,9 +43,11 @@ IP address.
 
 | Part | Notes |
 |---|---|
-| [Waveshare ESP32-S3-LCD-1.47](https://www.amazon.com/dp/B0DFTCC1FT?) | The **USB-A, non-touch** variant (not the 1.47B Type-C touch model). ESP32-S3R8, 16 MB flash, 8 MB PSRAM, 172×320 ST7789 LCD, microSD slot |
+| [Waveshare ESP32-S3-LCD-1.47](https://amzn.to/4iyeZ1x) (*) | The **USB-A, non-touch** variant (not the 1.47B Type-C touch model). ESP32-S3R8, 16 MB flash, 8 MB PSRAM, 172×320 ST7789 LCD, microSD slot |
 | Gotek with FlashFloppy | Any supported model; connects to the board's USB-A port |
 | microSD card | FAT32 or FAT16 formatted |
+
+(*) - As an Amazon Associate, I earn from qualifying purchases!
 
 Pin usage is fixed by the board (defined in `main/board.h`):
 
