@@ -9,8 +9,10 @@
 /* Swap/reinsert state machine. One writer at a time, via the apply
  * task in main.c; HTTP handlers only request a transition. In the
  * v15 whole-card design a "swap" is a local window: the card is
- * pulled from USB, mounted locally, edited (IMAGE_A.CFG, staged
- * uploads), and handed back. */
+ * pulled from USB, mounted locally, edited (IMAGE_A.CFG), and
+ * handed back. Eject leaves it locally mounted — and since v37
+ * that ejected state is also the upload state: uploads stream
+ * straight to the card while upload_active is set. */
 typedef enum {
     FF_STATE_IDLE,        /* card exposed to USB (or none yet), normal */
     FF_STATE_SWAP_PENDING,/* select/apply/eject requested, waiting for USB idle */
@@ -25,6 +27,11 @@ typedef struct {
     bool presented;             /* card currently exposed to USB */
     bool force_swap;            /* user-confirmed override, skips idle check */
     bool eject_requested;       /* pending op is an eject: stay unmounted */
+    bool restart_after_swap;    /* power-cycle the host after this
+                                   window completes (v28) */
+    bool upload_active;         /* a direct-to-card upload is
+                                   streaming (v37); windows are
+                                   refused until it finishes */
     char current_path[256];     /* image named by IMAGE_A.CFG — since
                                    v18 a bare root filename ("disk.hfe"),
                                    "" if none */

@@ -10,13 +10,14 @@
  * stick) via the esp_tinyusb MSC storage component, which owns the
  * TinyUSB MSC callbacks. Ownership of the card is temporal: at any
  * moment either USB owns it (the normal state) or the ESP32 has it
- * mounted locally (a "local window") to edit IMAGE_A.CFG and land
- * staged uploads. The component enforces the switch; these wrappers
- * track which side is active.
+ * mounted locally (a "local window") to edit IMAGE_A.CFG. Eject
+ * leaves the card in the local state, which is where uploads write
+ * (v37). The component enforces the switch; these wrappers track
+ * which side is active.
  *
  * ff_sdcard_init() must be called before ff_usb_install(), and no
  * filesystem path under FF_SD_MOUNT_POINT may be touched outside a
- * local window.
+ * local window or the ejected state it leaves behind.
  *
  * The local windows are bracketed by a real USB detach/attach
  * (tud_disconnect/tud_connect, v21): the component's mount switch

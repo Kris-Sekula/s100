@@ -3,7 +3,7 @@
 #include "state.h"
 #include "sdcard.h" /* ff_sdcard_handle() for the sector peek */
 #include <stdio.h>
-#include <stdlib.h> /* free() for staged buffers */
+#include <stdlib.h> /* malloc()/free() for the upload buffer */
 #include <string.h>
 #include <strings.h>
 #include <dirent.h>
@@ -20,14 +20,25 @@ static int s_entry_count;
 
 static bool is_config_name(const char *name)
 {
+    /* POWER.CFG (v38) is a config file, not a disk image: it joins
+     * FF.CFG/IMG.CFG in the UI's Config Files section and can no
+     * longer be "selected" as an image. WIFI.CFG stays unlisted
+     * entirely (it holds a password). */
     return strcasecmp(name, "FF.CFG") == 0 ||
-           strcasecmp(name, "IMG.CFG") == 0;
+           strcasecmp(name, "IMG.CFG") == 0 ||
+           strcasecmp(name, "POWER.CFG") == 0;
 }
 
 static bool is_backup_name(const char *name)
 {
     size_t n = strlen(name);
     return n > 4 && strcasecmp(name + n - 4, ".bak") == 0;
+}
+
+static bool is_partial_name(const char *name)
+{
+    size_t n = strlen(name);
+    return n > 5 && strcasecmp(name + n - 5, ".part") == 0;
 }
 
 static bool file_exists(const char *path)
@@ -147,6 +158,15 @@ esp_err_t ff_store_refresh(void)
             char path[420];
             snprintf(path, sizeof(path), "%s/%s", FF_SD_MOUNT_POINT,
                      e->d_name);
+            if (is_partial_name(e->d_name)) {
+                /* Leftover of an interrupted direct upload (v37):
+                 * never listed, and tidied away here — refresh only
+                 * runs while the card is locally mounted, and an
+                 * upload in progress holds its claim, so a .part
+                 * seen now is always stale. */
+                unlink(path);
+                continue;
+            }
             struct stat st;
             if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
             ff_entry_t *en = &s_entries[s_entry_count++];
@@ -268,87 +288,66 @@ esp_err_t ff_store_write_image_a(const char *rel)
     return ESP_OK;
 }
 
-/* ---- upload staging ---- */
+/* ---- direct streaming upload (v37) ---- */
 
-typedef struct {
-    char name[128];
-    uint8_t *data;
-    size_t len;
-} stage_entry_t;
-
-static stage_entry_t s_stage[FF_STAGE_MAX_FILES];
-static int s_stage_count;
-
-esp_err_t ff_stage_add(const char *name, uint8_t *data, size_t len)
+esp_err_t ff_store_write_stream(const char *name, ff_fill_fn fill,
+                                void *ctx, size_t *written_out)
 {
-    ff_state_lock();
-    if (s_stage_count >= FF_STAGE_MAX_FILES) {
-        ff_state_unlock();
+    char target[420], part[440];
+    snprintf(target, sizeof(target), "%s/%s", FF_SD_MOUNT_POINT,
+             name);
+    snprintf(part, sizeof(part), "%s.part", target);
+    FILE *f = fopen(part, "wb");
+    if (!f) {
+        ESP_LOGE(TAG, "upload: cannot create %s", part);
+        return ESP_FAIL;
+    }
+    uint8_t *buf = malloc(8192);
+    if (!buf) {
+        fclose(f);
+        unlink(part);
         return ESP_ERR_NO_MEM;
     }
-    /* Re-staging the same name replaces the earlier copy. */
-    for (int i = 0; i < s_stage_count; i++) {
-        if (strcasecmp(s_stage[i].name, name) == 0) {
-            free(s_stage[i].data);
-            s_stage[i].data = data;
-            s_stage[i].len = len;
-            ff_state_unlock();
-            return ESP_OK;
+    size_t total = 0;
+    esp_err_t err = ESP_OK;
+    for (;;) {
+        int n = fill(ctx, buf, 8192);
+        if (n < 0) { err = ESP_FAIL; break; }
+        if (n == 0) break;
+        if (fwrite(buf, 1, (size_t)n, f) != (size_t)n) {
+            err = ESP_FAIL; /* card full or media error */
+            break;
         }
+        total += (size_t)n;
     }
-    stage_entry_t *en = &s_stage[s_stage_count++];
-    snprintf(en->name, sizeof(en->name), "%s", name);
-    en->data = data;
-    en->len = len;
-    ff_state_unlock();
-    ESP_LOGI(TAG, "staged upload %s (%u bytes) for next local window",
-             name, (unsigned)len);
-    return ESP_OK;
-}
-
-int ff_stage_count(void)
-{
-    return s_stage_count;
-}
-
-bool ff_stage_get(int i, char *name_buf, size_t cap, size_t *len_out)
-{
-    ff_state_lock();
-    bool ok = i >= 0 && i < s_stage_count;
-    if (ok) {
-        snprintf(name_buf, cap, "%s", s_stage[i].name);
-        if (len_out) *len_out = s_stage[i].len;
+    if (err == ESP_OK) {
+        fflush(f);
+        if (fsync(fileno(f)) != 0) err = ESP_FAIL;
     }
-    ff_state_unlock();
-    return ok;
-}
-
-esp_err_t ff_store_flush_staged(void)
-{
-    ff_state_lock();
-    int n = s_stage_count;
-    ff_state_unlock();
-    for (int i = 0; i < n; i++) {
-        ff_state_lock();
-        stage_entry_t en = s_stage[i]; /* struct copy under lock */
-        ff_state_unlock();
-        /* Everything lands in the root (v18): images and the
-         * FF.CFG/IMG.CFG configs alike. */
-        char path[420];
-        snprintf(path, sizeof(path), "%s/%s", FF_SD_MOUNT_POINT, en.name);
-        FILE *f = fopen(path, "wb");
-        bool ok = f && fwrite(en.data, 1, en.len, f) == en.len;
-        if (f) fclose(f);
-        ESP_LOGI(TAG, "flush staged %s -> %s: %s", en.name, path,
-                 ok ? "ok" : "WRITE FAILED");
-        free(en.data);
+    fclose(f);
+    free(buf);
+    if (err != ESP_OK) {
+        unlink(part);
+        ESP_LOGE(TAG, "upload of %s aborted after %u bytes; the "
+                      "partial file was removed",
+                 name, (unsigned)total);
+        return err;
     }
-    ff_state_lock();
-    s_stage_count = 0;
-    ff_state_unlock();
+    /* FatFs rename will not overwrite an existing file: clear the
+     * way first (the container-era lesson). */
+    unlink(target);
+    if (rename(part, target) != 0) {
+        unlink(part);
+        ESP_LOGE(TAG, "upload of %s: rename into place failed",
+                 name);
+        return ESP_FAIL;
+    }
+    if (written_out) *written_out = total;
+    ESP_LOGI(TAG, "uploaded %s (%u bytes) directly to the card",
+             name, (unsigned)total);
     /* A freshly landed FF.CFG may still lack the setting selection
-     * depends on. */
-    ensure_ff_cfg();
+     * depends on (same guarantee the staged flush used to run). */
+    if (is_config_name(name)) ensure_ff_cfg();
     return ESP_OK;
 }
 

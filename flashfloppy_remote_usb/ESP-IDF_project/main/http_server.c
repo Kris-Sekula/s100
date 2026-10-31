@@ -2,6 +2,7 @@
 #include "board.h"
 #include "state.h"
 #include "storage.h"
+#include "power.h"
 #include "web_ui.h"
 #include <stdio.h>
 #include <string.h>
@@ -9,7 +10,6 @@
 #include <stdlib.h>
 #include "esp_log.h"
 #include "esp_http_server.h"
-#include "esp_heap_caps.h"
 #include "cJSON.h"
 
 static const char *TAG = "ff_http";
@@ -34,16 +34,6 @@ static esp_err_t send_conflict(httpd_req_t *req, const char *msg)
     return httpd_resp_send(req, msg, HTTPD_RESP_USE_STRLEN);
 }
 
-/* Same trick for other 4xx codes whose enum members vary between
- * IDF versions (411 / 413 have been renamed across releases). */
-static esp_err_t send_status(httpd_req_t *req, const char *status,
-                             const char *msg)
-{
-    httpd_resp_set_status(req, status);
-    httpd_resp_set_type(req, "text/plain");
-    return httpd_resp_send(req, msg, HTTPD_RESP_USE_STRLEN);
-}
-
 static esp_err_t h_root(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
@@ -56,20 +46,24 @@ static esp_err_t h_root(httpd_req_t *req)
 static esp_err_t h_status(httpd_req_t *req)
 {
     char buf[768];
+    bool ejected = !g_ff.presented && g_ff.state == FF_STATE_IDLE;
     snprintf(buf, sizeof(buf),
              "{\"current\":\"%s\",\"state\":\"%s\",\"presented\":%s,"
-             "\"staged\":%d,\"wifi\":\"%s\"}",
+             "\"ejected\":%s,\"uploading\":%s,\"wifi\":\"%s\"}",
              g_ff.current_path, ff_state_name(g_ff.state),
              g_ff.presented ? "true" : "false",
-             ff_stage_count(), g_ff.wifi_desc);
+             ejected ? "true" : "false",
+             g_ff.upload_active ? "true" : "false",
+             g_ff.wifi_desc);
     return send_json(req, buf);
 }
 
 static esp_err_t h_library(httpd_req_t *req)
 {
     /* The card itself is off-limits while USB owns it, so this
-     * serves the snapshot taken at the last local window, plus any
-     * uploads currently staged in RAM. */
+     * serves the snapshot taken at the last local window. While
+     * ejected, uploads land on the card immediately and the
+     * snapshot is refreshed after each one (v37). */
     cJSON *root = cJSON_CreateObject();
     cJSON *files = cJSON_AddArrayToObject(root, "files");
     /* Emit in passes so the UI list groups images first, backups
@@ -97,17 +91,6 @@ static esp_err_t h_library(httpd_req_t *req)
         cJSON_AddItemToArray(files, f);
     }
     } /* end passes */
-    for (int i = 0; ; i++) {
-        char name[128];
-        size_t len = 0;
-        if (!ff_stage_get(i, name, sizeof(name), &len)) break;
-        cJSON *f = cJSON_CreateObject();
-        cJSON_AddStringToObject(f, "name", name);
-        cJSON_AddStringToObject(f, "path", "");
-        cJSON_AddNumberToObject(f, "size", (double)len);
-        cJSON_AddStringToObject(f, "kind", "staged");
-        cJSON_AddItemToArray(files, f);
-    }
     char *json = cJSON_PrintUnformatted(root);
     esp_err_t err = send_json(req, json);
     cJSON_free(json);
@@ -117,9 +100,13 @@ static esp_err_t h_library(httpd_req_t *req)
 
 /* Shared request-a-window logic for select / reinsert / eject. */
 static esp_err_t request_window(httpd_req_t *req, const char *pending,
-                                bool eject)
+                                bool eject, bool restart)
 {
     ff_state_lock();
+    if (g_ff.upload_active) {
+        ff_state_unlock();
+        return send_conflict(req, "upload in progress");
+    }
     if (g_ff.state == FF_STATE_SWAP_PENDING ||
         g_ff.state == FF_STATE_DISCONNECTED ||
         g_ff.state == FF_STATE_APPLYING) {
@@ -133,6 +120,7 @@ static esp_err_t request_window(httpd_req_t *req, const char *pending,
         g_ff.pending_path[0] = 0;
     }
     g_ff.eject_requested = eject;
+    g_ff.restart_after_swap = restart;
     g_ff.state = FF_STATE_SWAP_PENDING;
     ff_state_unlock();
     return send_json(req, "{\"ok\":true}");
@@ -164,26 +152,87 @@ static esp_err_t h_select(httpd_req_t *req)
     }
     char chosen[256];
     snprintf(chosen, sizeof(chosen), "%s", path->valuestring);
+    /* Optional: power-cycle the host once the swap completes. */
+    bool want_restart =
+        cJSON_IsTrue(cJSON_GetObjectItem(root, "restart"));
     cJSON_Delete(root);
     if (!ok) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
                                    "not a selectable image on the card");
     }
-    return request_window(req, chosen, false);
+    return request_window(req, chosen, false, want_restart);
 }
 
 static esp_err_t h_reinsert(httpd_req_t *req)
 {
-    /* Apply staged uploads / refresh, keeping the current image. */
-    return request_window(req, NULL, false);
+    /* Refresh our view and hand the card back, keeping the
+     * current image. Also the way out of the ejected/upload
+     * state. */
+    return request_window(req, NULL, false, false);
 }
 
 static esp_err_t h_eject(httpd_req_t *req)
 {
     /* Eject = pull the card and keep it pulled: the apply task runs
-     * a window (staged uploads still land, our view refreshes) but
-     * does not hand the card back. */
-    return request_window(req, NULL, true);
+     * a window (our view refreshes) but does not hand the card
+     * back. The state it leaves behind — locally mounted, absent
+     * from USB — is the upload state (v37). */
+    return request_window(req, NULL, true, false);
+}
+
+/* Kasa power control (v28): the strip feeding the host machine.
+ * GET reports a live query; POST takes {"action":"on|off|restart"}. */
+static esp_err_t h_power_get(httpd_req_t *req)
+{
+    if (!ff_power_configured()) {
+        return send_json(req, "{\"configured\":false}");
+    }
+    /* Served from the poll cache (v36): the background task keeps
+     * it within FF_POWER_POLL_MS of the truth, so this handler
+     * never blocks on the strip. */
+    bool on = false, reachable = false;
+    float watts = 0;
+    ff_power_cached_state(&on, &watts, &reachable);
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "{\"configured\":true,\"name\":\"%s\",\"reachable\":%s,"
+             "\"on\":%s,\"watts\":%.1f,\"restarting\":%s}",
+             ff_power_name(), reachable ? "true" : "false",
+             on ? "true" : "false", (double)watts,
+             ff_power_restarting() ? "true" : "false");
+    return send_json(req, buf);
+}
+
+static esp_err_t h_power_post(httpd_req_t *req)
+{
+    if (!ff_power_configured()) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "power control not configured");
+    }
+    char body[192];
+    int len = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (len <= 0) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
+    }
+    body[len] = 0;
+    cJSON *root = cJSON_Parse(body);
+    const char *action = cJSON_GetStringValue(
+        root ? cJSON_GetObjectItem(root, "action") : NULL);
+    esp_err_t err = ESP_ERR_INVALID_ARG;
+    if (action && strcmp(action, "on") == 0) {
+        err = ff_power_set(true);
+    } else if (action && strcmp(action, "off") == 0) {
+        err = ff_power_set(false);
+    } else if (action && strcmp(action, "restart") == 0) {
+        ff_power_restart_async();
+        err = ESP_OK;
+    }
+    cJSON_Delete(root);
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "power command failed");
+    }
+    return send_json(req, "{\"ok\":true}");
 }
 
 /* In-place percent-decoding for the upload ?name= value (query strings
@@ -213,17 +262,30 @@ static void url_decode_in_place(char *s)
     *w = 0;
 }
 
+/* Body source for ff_store_write_stream: pull the next chunk of
+ * the HTTP request body. httpd_req_recv returns 0 when the body
+ * is complete, negative on socket error/timeout. */
+typedef struct { httpd_req_t *req; } up_ctx_t;
+static int upload_fill(void *vctx, uint8_t *buf, size_t cap)
+{
+    int n = httpd_req_recv(((up_ctx_t *)vctx)->req, (char *)buf, cap);
+    return n < 0 ? -1 : n;
+}
+
 static esp_err_t h_upload(httpd_req_t *req)
 {
-    /* ?name=<file>: the client (the embedded UI) sends the file as the
-     * RAW request body, not multipart form data — no boundary parsing,
-     * and the body streams straight into the staging buffer.
+    /* ?name=<file>: the client (the embedded UI) sends the file as
+     * the RAW request body, not multipart form data.
      *
-     * v15 staging: while the card belongs to USB the ESP32 cannot
-     * write it, so the upload is held in PSRAM and lands on the card
-     * at the next local window (Select / Re-insert / Eject). The
-     * whole body must fit the staging cap, so Content-Length is
-     * required and checked up front. */
+     * v37 direct-to-card: uploads only run while the drive is
+     * EJECTED — the state where the card is locally mounted and
+     * the ESP32 is its sole owner. The body streams through an
+     * 8 KB buffer into <name>.part on the card and is renamed
+     * into place on success, so there is no size limit but the
+     * card itself, and an interrupted upload leaves nothing
+     * FlashFloppy could try to mount. While presented, the
+     * handler refuses with "eject the drive before uploading"
+     * and the UI greys the button out. */
     char query[192];
     char name_raw[128];
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
@@ -246,8 +308,7 @@ static esp_err_t h_upload(httpd_req_t *req)
      * and accepting an upload of it would fight the selection
      * mechanism. INIT_A.CFG is likewise refused (selection here is
      * IMAGE_A-based). FF.CFG / IMG.CFG are configuration and ARE
-     * accepted, under their canonical uppercase names, and land in
-     * the card root at flush time. */
+     * accepted, under their canonical uppercase names. */
     static char canon[128];
     if (strcasecmp(name, "FF.CFG") == 0) {
         strcpy(canon, "FF.CFG");
@@ -263,48 +324,42 @@ static esp_err_t h_upload(httpd_req_t *req)
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
                                    "INIT_A.CFG is not used by this design");
     }
-    if (req->content_len <= 0) {
-        return send_status(req, "411 Length Required",
-                           "Content-Length required");
-    }
-    /* Refuse uploads while a local window is running or queued: the
-     * staging table is being flushed then, and re-staging the same
-     * name mid-flush could free a buffer out from under the write. */
+    /* Claim the ejected state for the duration of the stream.
+     * The check-and-set is atomic under the state lock, and
+     * request_window() refuses to start a window while the claim
+     * is held, so nothing else can touch the card mid-upload. */
     ff_state_lock();
-    bool busy = g_ff.state == FF_STATE_SWAP_PENDING ||
+    bool busy = g_ff.upload_active ||
+                g_ff.state == FF_STATE_SWAP_PENDING ||
                 g_ff.state == FF_STATE_DISCONNECTED ||
                 g_ff.state == FF_STATE_APPLYING;
+    bool ejected = g_ff.state == FF_STATE_IDLE && !g_ff.presented;
+    if (!busy && ejected) g_ff.upload_active = true;
     ff_state_unlock();
     if (busy) {
         return send_conflict(req, "operation in progress");
     }
-    if ((size_t)req->content_len > FF_STAGE_MAX_BYTES) {
-        return send_status(req, "413 Content Too Large",
-                           "file exceeds the upload staging limit");
+    if (!ejected) {
+        return send_conflict(req,
+                             "eject the drive before uploading");
     }
-    uint8_t *buf = heap_caps_malloc(req->content_len, MALLOC_CAP_SPIRAM);
-    if (!buf) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                                   "no staging memory");
+    up_ctx_t ctx = {req};
+    size_t written = 0;
+    esp_err_t err = ff_store_write_stream(name, upload_fill, &ctx,
+                                          &written);
+    if (err == ESP_OK) {
+        /* The library snapshot should list the new file at once. */
+        ff_store_refresh();
     }
-    size_t got = 0;
-    while (got < (size_t)req->content_len) {
-        int n = httpd_req_recv(req, (char *)buf + got,
-                               (size_t)req->content_len - got);
-        if (n <= 0) {
-            free(buf);
-            return httpd_resp_send_err(req,
-                                       HTTPD_500_INTERNAL_SERVER_ERROR,
-                                       "receive failed");
-        }
-        got += (size_t)n;
+    ff_state_lock();
+    g_ff.upload_active = false;
+    ff_state_unlock();
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(req,
+                                   HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "upload failed");
     }
-    if (ff_stage_add(name, buf, got) != ESP_OK) {
-        free(buf);
-        return send_conflict(req, "staging area full");
-    }
-    ESP_LOGI(TAG, "upload staged: %s (%u bytes)", name, (unsigned)got);
-    return send_json(req, "{\"ok\":true,\"staged\":true}");
+    return send_json(req, "{\"ok\":true}");
 }
 
 esp_err_t ff_http_start(void)
@@ -316,6 +371,15 @@ esp_err_t ff_http_start(void)
      * Kris's first upload). Handlers here allocate on the heap/PSRAM,
      * but keep the headroom anyway. */
     config.stack_size = 8192;
+    /* HTTPD_DEFAULT_CONFIG allows only 8 URI handlers; we register
+     * 9 since /api/power gained a POST twin in v28 — whose
+     * registration silently failed until v29, so GET worked but
+     * every POST came back 405 Method Not Allowed (Kris's log). */
+    config.max_uri_handlers = 16;
+    /* Direct uploads (v37) stream bodies of any size; give a slow
+     * sender generous gaps between chunks before the socket is
+     * treated as dead. */
+    config.recv_wait_timeout = 30;
     ESP_ERROR_CHECK(httpd_start(&server, &config));
     const httpd_uri_t uris[] = {
         {.uri = "/", .method = HTTP_GET, .handler = h_root},
@@ -325,8 +389,16 @@ esp_err_t ff_http_start(void)
         {.uri = "/api/eject", .method = HTTP_POST, .handler = h_eject},
         {.uri = "/api/reinsert", .method = HTTP_POST, .handler = h_reinsert},
         {.uri = "/api/upload", .method = HTTP_POST, .handler = h_upload},
+        {.uri = "/api/power", .method = HTTP_GET, .handler = h_power_get},
+        {.uri = "/api/power", .method = HTTP_POST, .handler = h_power_post},
     };
-    for (int i = 0; i < 7; i++) httpd_register_uri_handler(server, &uris[i]);
+    for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
+        esp_err_t r = httpd_register_uri_handler(server, &uris[i]);
+        if (r != ESP_OK) {
+            ESP_LOGE(TAG, "URI handler %s failed to register: %s",
+                     uris[i].uri, esp_err_to_name(r));
+        }
+    }
     ESP_LOGI(TAG, "HTTP server up");
     return ESP_OK;
 }

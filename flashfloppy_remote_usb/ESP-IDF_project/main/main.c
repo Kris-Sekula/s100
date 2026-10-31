@@ -2,9 +2,11 @@
 #include "state.h"
 #include "sdcard.h"
 #include "storage.h"
+#include "power.h"
 #include "http_server.h"
 #include "lcd.h"
 #include <stdio.h>  /* snprintf() */
+#include <stdlib.h> /* atoi() for the POWER.CFG parser */
 #include <string.h>
 #include <strings.h> /* strcasecmp() for the WIFI.CFG parser */
 #include <sys/stat.h> /* stat() for the boot auto-present check */
@@ -118,6 +120,38 @@ static bool read_sta_cfg(sta_cfg_t *cfg)
     return cfg->ssid[0] && strcasecmp(cfg->mode, "ap") != 0;
 }
 
+/* POWER.CFG (v28): the Kasa strip that feeds the host machine, so
+ * the web UI can power-cycle it after a swap. Same line format and
+ * boot-window timing as WIFI.CFG; absent file = feature off. */
+static void read_power_cfg(void)
+{
+    ff_power_cfg_t cfg = {0};
+    FILE *f = fopen(FF_POWER_CFG_PATH, "r");
+    if (!f) return;
+    char line[192];
+    while (fgets(line, sizeof(line), f)) {
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = 0;
+        char *key = line, *val = eq + 1;
+        trim(key);
+        trim(val);
+        if (strcasecmp(key, "host") == 0) {
+            copy_field(cfg.host, sizeof(cfg.host), val);
+        } else if (strcasecmp(key, "port") == 0) {
+            cfg.port = atoi(val);
+        } else if (strcasecmp(key, "outlet") == 0) {
+            cfg.outlet = atoi(val);
+        } else if (strcasecmp(key, "delay") == 0) {
+            cfg.delay_s = atoi(val);
+        } else if (strcasecmp(key, "name") == 0) {
+            copy_field(cfg.name, sizeof(cfg.name), val);
+        }
+    }
+    fclose(f);
+    if (cfg.host[0]) ff_power_configure(&cfg);
+}
+
 static void wifi_start_ap(void)
 {
     esp_netif_create_default_wifi_ap();
@@ -193,20 +227,22 @@ static void wifi_init(void)
  *  1. Pull the card from USB and mount it locally (the storage
  *     component signals media removal; FlashFloppy sees the stick
  *     leave, exactly like Kris's physical bench test).
- *  2. Dwell, so the removal registers before the card comes back.
+ *  2. Dwell (skipped for eject), so the removal registers before
+ *     the card comes back.
  *  3. Refresh our view from the card (IMAGE_A.CFG may have been
  *     changed by FlashFloppy itself, e.g. a Gotek-side selection).
- *  4. Flush staged uploads to the card.
- *  5. On a select, write IMAGE_A.CFG naming the chosen image.
- *  6. Refresh again (the UI now lists what really landed), then hand
+ *  4. On a select, write IMAGE_A.CFG naming the chosen image.
+ *  5. Refresh again (the UI now lists what really landed), then hand
  *     the card back — FlashFloppy re-reads it and, with
  *     image-on-startup = last, mounts the named image. Eject skips
- *     the hand-back: the card stays locally mounted and absent. */
+ *     the hand-back: the card stays locally mounted and absent —
+ *     which since v37 is also the upload state, in which uploads
+ *     stream straight to the card with no staging step here. */
 static void apply_task(void *arg)
 {
     (void)arg;
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(250));
+        vTaskDelay(pdMS_TO_TICKS(100));
         ff_state_lock();
         if (g_ff.state != FF_STATE_SWAP_PENDING) {
             ff_state_unlock();
@@ -215,8 +251,10 @@ static void apply_task(void *arg)
         char pending[256];
         snprintf(pending, sizeof(pending), "%s", g_ff.pending_path);
         bool eject = g_ff.eject_requested;
+        bool restart = g_ff.restart_after_swap;
         g_ff.pending_path[0] = 0;
         g_ff.eject_requested = false;
+        g_ff.restart_after_swap = false;
         g_ff.force_swap = false;
         g_ff.state = FF_STATE_DISCONNECTED;
         ff_state_unlock();
@@ -232,14 +270,18 @@ static void apply_task(void *arg)
         g_ff.state = FF_STATE_APPLYING;
         ff_state_unlock();
 
-        vTaskDelay(pdMS_TO_TICKS(FF_DISCONNECT_DWELL_MS));
+        if (!eject) {
+            /* The dwell lets a swap's removal register before the
+             * card comes back; an eject never comes back, so it
+             * skips the wait (v38: eject felt very slow). */
+            vTaskDelay(pdMS_TO_TICKS(FF_DISCONNECT_DWELL_MS));
+        }
 
         ff_store_refresh();
-        ff_store_flush_staged();
         if (!eject && pending[0]) {
             ff_store_write_image_a(pending);
+            ff_store_refresh();
         }
-        ff_store_refresh();
 
         if (eject) {
             ff_state_lock();
@@ -256,6 +298,12 @@ static void apply_task(void *arg)
             ESP_LOGI(TAG, "card re-inserted; FlashFloppy should mount "
                           "%s", g_ff.current_path);
             ff_lcd_show_status("Presented", g_ff.current_path);
+            if (restart) {
+                /* The point of the power feature: swap the image,
+                 * then bounce the host so it boots the new one. */
+                ESP_LOGI(TAG, "restart-after-swap requested");
+                ff_power_restart_async();
+            }
         } else {
             ff_state_lock();
             g_ff.state = FF_STATE_IDLE;
@@ -330,6 +378,7 @@ void app_main(void)
         ff_usb_install();
         if (ff_sdcard_local_begin() == ESP_OK) {
             ff_store_prepare();
+            read_power_cfg(); /* Kasa strip config, if any (v28) */
             /* Auto-present (carried over from v12, now trivial):
              * the NVS record names the last used image; if it is
              * still on the card, make IMAGE_A.CFG name it — that is
@@ -372,13 +421,16 @@ void app_main(void)
     if (card_ok) {
         ff_sdcard_local_end(); /* hand the card to the Gotek */
     }
-    /* 8192: the apply task's call chain (storage refresh, staged
-     * flush, stdio over FatFs) needs the same headroom the swap
-     * task did — 4096 overflowed twice in this project's history. */
+    /* 8192: the apply task's call chain (storage refresh, stdio
+     * over FatFs) needs the same headroom the swap task did —
+     * 4096 overflowed twice in this project's history. */
     xTaskCreate(apply_task, "ff_apply", 8192, NULL, 5, NULL);
     if (card_ok) {
         /* Watches for Gotek-side selections via the sector peek. */
         xTaskCreate(peek_task, "ff_peek", 4096, NULL, 4, NULL);
     }
+    /* v36: keep the Kasa outlet's state + watts fresh in the
+     * background (no-op when POWER.CFG is absent). */
+    ff_power_start_polling();
     ESP_LOGI(TAG, "FlashFloppy ESP32 frontend up (whole-card design)");
 }

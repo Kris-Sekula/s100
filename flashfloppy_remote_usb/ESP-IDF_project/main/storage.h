@@ -7,8 +7,9 @@
 
 /* Card-content layer for the v15 whole-card design. Every function
  * here operates on the locally mounted card and may only be called
- * inside a local window (see sdcard.h) — except the snapshot/staging
- * accessors, which serve the HTTP handlers from RAM at any time. */
+ * inside a local window (see sdcard.h) or in the ejected state the
+ * window leaves behind — except the snapshot accessors, which serve
+ * the HTTP handlers from RAM at any time. */
 
 typedef enum { FF_KIND_IMAGE = 0, FF_KIND_CONFIG, FF_KIND_BACKUP } ff_kind_t;
 
@@ -37,16 +38,16 @@ const ff_entry_t *ff_store_entry(int i);
  * filename in the root (e.g. "disk.hfe"). Local window only. */
 esp_err_t ff_store_write_image_a(const char *rel);
 
-/* PSRAM upload staging: while the card belongs to USB, uploads are
- * held in RAM and flushed during the next local window. */
-esp_err_t ff_stage_add(const char *name, uint8_t *data, size_t len); /* takes ownership of data on success */
-int ff_stage_count(void);
-bool ff_stage_get(int i, char *name_buf, size_t cap, size_t *len_out);
-
-/* Write every staged file to its place on the card (images to the
- * library, FF.CFG/IMG.CFG to the root), then free the buffers.
- * Local window only. */
-esp_err_t ff_store_flush_staged(void);
+/* Direct streaming upload (v37, replacing PSRAM staging): the
+ * body is written straight to the card as <name>.part and renamed
+ * into place only when the stream completes cleanly, so an
+ * interrupted upload never leaves a partial file FlashFloppy
+ * could try to mount. Any size the card can hold. Ejected/local
+ * state only. fill(ctx, buf, cap) returns >0 bytes read, 0 at
+ * end of body, <0 on error. */
+typedef int (*ff_fill_fn)(void *ctx, uint8_t *buf, size_t cap);
+esp_err_t ff_store_write_stream(const char *name, ff_fill_fn fill,
+                                void *ctx, size_t *written_out);
 
 /* Read IMAGE_A.CFG by raw sectors while the card is with USB
  * (v26): walks MBR/BPB/root directory directly. Read-only — it can

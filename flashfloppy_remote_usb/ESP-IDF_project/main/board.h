@@ -41,13 +41,11 @@
 #define FF_FF_CFG_PATH    "/sdcard/FF.CFG"
 #define FF_IMG_CFG_PATH   "/sdcard/IMG.CFG"
 
-/* Upload staging (v15): while the card is presented to the Gotek the
- * ESP32 cannot write it, so uploads are held in PSRAM and flushed to
- * the card during the next local window (Select / Re-insert / Eject).
- * The cap is the staging buffer size; very large flux images that do
- * not fit are refused with a clear error instead of corrupting. */
-#define FF_STAGE_MAX_BYTES (7 * 1024 * 1024)
-#define FF_STAGE_MAX_FILES 4
+/* Uploads (v37): there is no staging area any more. Uploads stream
+ * straight to the card while the drive is EJECTED (the card is
+ * locally mounted then, so the ESP32 is its sole owner) — any file
+ * size the card can hold. The v15–v36 PSRAM staging buffer and its
+ * 7 MB / 4-file cap are gone. */
 
 /* Swap idle thresholds from the 2026-10-27 design (heuristics: the ESP32
  * sees USB traffic, not the floppy bus). Swap only when the host is idle,
@@ -80,5 +78,11 @@
  * (the update script replaces main/ wholesale). Plaintext on the
  * card, like every embedded gadget; LAN-only either way. */
 #define FF_WIFI_CFG_PATH "/sdcard/WIFI.CFG"
+/* Optional Kasa power-strip config (v28): host=/port=/outlet=/
+ * delay=/name= lines; parsed by main.c during the boot window. */
+#define FF_POWER_CFG_PATH "/sdcard/POWER.CFG"
+/* How often the power module re-reads the outlet (state + watts)
+ * in the background (v36, Kris's ask: catch flips made elsewhere). */
+#define FF_POWER_POLL_MS 5000
 #define FF_WIFI_SSID "FlashFloppy"
 #define FF_WIFI_PASS "flashfloppy"
