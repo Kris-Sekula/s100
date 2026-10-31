@@ -4,6 +4,7 @@
 #include "storage.h"
 #include "power.h"
 #include "web_ui.h"
+#include "util.h"
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
@@ -43,19 +44,40 @@ static esp_err_t h_root(httpd_req_t *req)
     return httpd_resp_send(req, FF_WEB_UI_HTML, HTTPD_RESP_USE_STRLEN);
 }
 
+/* Serialise a cJSON tree and send it; frees the tree. */
+static esp_err_t send_cjson(httpd_req_t *req, cJSON *root)
+{
+    char *json = root ? cJSON_PrintUnformatted(root) : NULL;
+    cJSON_Delete(root);
+    if (!json) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "out of memory");
+    }
+    esp_err_t err = send_json(req, json);
+    cJSON_free(json);
+    return err;
+}
+
 static esp_err_t h_status(httpd_req_t *req)
 {
-    char buf[768];
+    /* v39: built with cJSON (a filename containing '"' or '\' used to
+     * produce invalid JSON and stall the UI's polling) and copied
+     * under the state lock (no torn strings). */
+    cJSON *root = cJSON_CreateObject();
+    ff_state_lock();
     bool ejected = !g_ff.presented && g_ff.state == FF_STATE_IDLE;
-    snprintf(buf, sizeof(buf),
-             "{\"current\":\"%s\",\"state\":\"%s\",\"presented\":%s,"
-             "\"ejected\":%s,\"uploading\":%s,\"wifi\":\"%s\"}",
-             g_ff.current_path, ff_state_name(g_ff.state),
-             g_ff.presented ? "true" : "false",
-             ejected ? "true" : "false",
-             g_ff.upload_active ? "true" : "false",
-             g_ff.wifi_desc);
-    return send_json(req, buf);
+    cJSON_AddStringToObject(root, "current", g_ff.current_path);
+    cJSON_AddStringToObject(root, "state", ff_state_name(g_ff.state));
+    cJSON_AddBoolToObject(root, "presented", g_ff.presented);
+    cJSON_AddBoolToObject(root, "ejected", ejected);
+    cJSON_AddBoolToObject(root, "uploading", g_ff.upload_active);
+    cJSON_AddBoolToObject(root, "waiting_usb",
+                          g_ff.state == FF_STATE_SWAP_PENDING &&
+                              g_ff.waiting_usb);
+    cJSON_AddStringToObject(root, "wifi", g_ff.wifi_desc);
+    cJSON_AddStringToObject(root, "error", g_ff.last_error);
+    ff_state_unlock();
+    return send_cjson(req, root);
 }
 
 static esp_err_t h_library(httpd_req_t *req)
@@ -69,33 +91,33 @@ static esp_err_t h_library(httpd_req_t *req)
     /* Emit in passes so the UI list groups images first, backups
      * next, and the CFG files last instead of mixed in with the
      * real images (Kris, 2026-10-30). Within a group the card's
-     * own directory order is kept. */
+     * own directory order is kept. The snapshot is read under the
+     * state lock (v39): a refresh publishes under the same lock. */
+    ff_state_lock();
     for (int pass = 0; pass < 3; pass++) {
-    for (int i = 0; i < ff_store_count(); i++) {
-        const ff_entry_t *en = ff_store_entry(i);
-        if (!en) continue;
-        int rank = en->kind == FF_KIND_IMAGE ? 0
-                   : en->kind == FF_KIND_BACKUP ? 1 : 2;
-        if (rank != pass) continue;
-        cJSON *f = cJSON_CreateObject();
-        cJSON_AddStringToObject(f, "name", en->name);
-        /* Since v18 everything lives in the root, so the path the
-         * UI sends back on Select is simply the filename — the same
-         * string IMAGE_A.CFG will hold. */
-        cJSON_AddStringToObject(f, "path", en->name);
-        cJSON_AddNumberToObject(f, "size", en->size);
-        cJSON_AddStringToObject(f, "kind",
-                                en->kind == FF_KIND_CONFIG ? "config"
-                                : en->kind == FF_KIND_BACKUP ? "backup"
-                                                             : "image");
-        cJSON_AddItemToArray(files, f);
+        for (int i = 0; i < ff_store_count(); i++) {
+            const ff_entry_t *en = ff_store_entry(i);
+            if (!en) continue;
+            int rank = en->kind == FF_KIND_IMAGE ? 0
+                       : en->kind == FF_KIND_BACKUP ? 1 : 2;
+            if (rank != pass) continue;
+            cJSON *f = cJSON_CreateObject();
+            cJSON_AddStringToObject(f, "name", en->name);
+            /* Since v18 everything lives in the root, so the path
+             * the UI sends back on Select is simply the filename —
+             * the same string IMAGE_A.CFG will hold. */
+            cJSON_AddStringToObject(f, "path", en->name);
+            cJSON_AddNumberToObject(f, "size", en->size);
+            cJSON_AddStringToObject(f, "kind",
+                                    en->kind == FF_KIND_CONFIG ? "config"
+                                    : en->kind == FF_KIND_BACKUP
+                                        ? "backup"
+                                        : "image");
+            cJSON_AddItemToArray(files, f);
+        }
     }
-    } /* end passes */
-    char *json = cJSON_PrintUnformatted(root);
-    esp_err_t err = send_json(req, json);
-    cJSON_free(json);
-    cJSON_Delete(root);
-    return err;
+    ff_state_unlock();
+    return send_cjson(req, root);
 }
 
 /* Shared request-a-window logic for select / reinsert / eject. */
@@ -121,8 +143,13 @@ static esp_err_t request_window(httpd_req_t *req, const char *pending,
     }
     g_ff.eject_requested = eject;
     g_ff.restart_after_swap = restart;
+    g_ff.force_swap = false;
+    g_ff.waiting_usb = false;
+    g_ff.pending_since_ms = ff_now_ms();
+    g_ff.last_error[0] = 0; /* a new request starts clean */
     g_ff.state = FF_STATE_SWAP_PENDING;
     ff_state_unlock();
+    ff_apply_kick();
     return send_json(req, "{\"ok\":true}");
 }
 
@@ -144,12 +171,7 @@ static esp_err_t h_select(httpd_req_t *req)
     /* The path must name a real image from the snapshot: config files
      * are applied by the storage layer, backups are not images, and
      * anything else is simply not on the card. */
-    bool ok = false;
-    for (int i = 0; i < ff_store_count(); i++) {
-        const ff_entry_t *en = ff_store_entry(i);
-        if (!en || en->kind != FF_KIND_IMAGE) continue;
-        if (strcmp(path->valuestring, en->name) == 0) { ok = true; break; }
-    }
+    bool ok = ff_store_has_image(path->valuestring);
     char chosen[256];
     snprintf(chosen, sizeof(chosen), "%s", path->valuestring);
     /* Optional: power-cycle the host once the swap completes. */
@@ -180,27 +202,43 @@ static esp_err_t h_eject(httpd_req_t *req)
     return request_window(req, NULL, true, false);
 }
 
+static esp_err_t h_force(httpd_req_t *req)
+{
+    /* v39: skip the USB idle wait for the queued request. The UI
+     * offers this while the status says waiting_usb — i.e. the
+     * Gotek keeps reading, or has written within FF_IDLE_WRITE_MS.
+     * Forcing mid-write can corrupt what was being written. */
+    ff_state_lock();
+    bool pending = g_ff.state == FF_STATE_SWAP_PENDING;
+    if (pending) g_ff.force_swap = true;
+    ff_state_unlock();
+    if (!pending) return send_conflict(req, "nothing is waiting");
+    ff_apply_kick();
+    return send_json(req, "{\"ok\":true}");
+}
+
 /* Kasa power control (v28): the strip feeding the host machine.
  * GET reports a live query; POST takes {"action":"on|off|restart"}. */
 static esp_err_t h_power_get(httpd_req_t *req)
 {
-    if (!ff_power_configured()) {
-        return send_json(req, "{\"configured\":false}");
+    /* Served from the power module's cache (v36) — this handler
+     * never touches the network. cJSON since v39 (the name comes
+     * from POWER.CFG and may contain anything). */
+    ff_power_status_t st;
+    ff_power_get_status(&st);
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "configured", st.configured);
+    if (st.configured) {
+        cJSON_AddStringToObject(root, "name", st.name);
+        cJSON_AddBoolToObject(root, "reachable", st.reachable);
+        cJSON_AddBoolToObject(root, "on", st.on);
+        cJSON_AddNumberToObject(root, "watts",
+                                (double)((int)(st.watts * 10.0f)) / 10.0);
+        cJSON_AddBoolToObject(root, "busy", st.busy);
+        cJSON_AddBoolToObject(root, "restarting", st.restarting);
+        cJSON_AddStringToObject(root, "error", st.error);
     }
-    /* Served from the poll cache (v36): the background task keeps
-     * it within FF_POWER_POLL_MS of the truth, so this handler
-     * never blocks on the strip. */
-    bool on = false, reachable = false;
-    float watts = 0;
-    ff_power_cached_state(&on, &watts, &reachable);
-    char buf[256];
-    snprintf(buf, sizeof(buf),
-             "{\"configured\":true,\"name\":\"%s\",\"reachable\":%s,"
-             "\"on\":%s,\"watts\":%.1f,\"restarting\":%s}",
-             ff_power_name(), reachable ? "true" : "false",
-             on ? "true" : "false", (double)watts,
-             ff_power_restarting() ? "true" : "false");
-    return send_json(req, buf);
+    return send_cjson(req, root);
 }
 
 static esp_err_t h_power_post(httpd_req_t *req)
@@ -218,21 +256,45 @@ static esp_err_t h_power_post(httpd_req_t *req)
     cJSON *root = cJSON_Parse(body);
     const char *action = cJSON_GetStringValue(
         root ? cJSON_GetObjectItem(root, "action") : NULL);
-    esp_err_t err = ESP_ERR_INVALID_ARG;
-    if (action && strcmp(action, "on") == 0) {
-        err = ff_power_set(true);
-    } else if (action && strcmp(action, "off") == 0) {
-        err = ff_power_set(false);
-    } else if (action && strcmp(action, "restart") == 0) {
-        ff_power_restart_async();
-        err = ESP_OK;
-    }
+    int cmd = -1;
+    if (action && strcmp(action, "on") == 0) cmd = FF_POWER_ON;
+    else if (action && strcmp(action, "off") == 0) cmd = FF_POWER_OFF;
+    else if (action && strcmp(action, "restart") == 0)
+        cmd = FF_POWER_RESTART;
     cJSON_Delete(root);
-    if (err != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                                   "power command failed");
+    if (cmd < 0) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "action must be on, off or restart");
     }
-    return send_json(req, "{\"ok\":true}");
+    /* v39: queued, never executed here — v38 ran on/off on the
+     * HTTP task, and an absent strip froze the whole web UI. The
+     * outcome shows up in GET /api/power (busy, then on/error). */
+    if (ff_power_request((ff_power_cmd_t)cmd) != ESP_OK) {
+        return send_conflict(req, "a power command is already running");
+    }
+    return send_json(req, "{\"ok\":true,\"queued\":true}");
+}
+
+/* v39: names FAT cannot store, and our own upload temporaries, are
+ * refused up front instead of failing at fopen() time. */
+static const char *upload_name_problem(const char *name)
+{
+    size_t n = strlen(name);
+    if (n == 0) return "empty file name";
+    if (n > 120) return "file name too long (120 characters max)";
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        if (*p < 0x20 || *p == 0x7f || strchr("<>:\"|?*", *p)) {
+            return "file name contains a character FAT cannot store "
+                   "(< > : \" | ? * or a control character)";
+        }
+    }
+    if (name[n - 1] == '.' || name[n - 1] == ' ') {
+        return "file name cannot end with a dot or space";
+    }
+    if (ff_store_is_temp_name(name)) {
+        return "names ending in .part or .prev are reserved";
+    }
+    return NULL;
 }
 
 /* In-place percent-decoding for the upload ?name= value (query strings
@@ -304,18 +366,19 @@ static esp_err_t h_upload(httpd_req_t *req)
     if (!name[0] || strstr(name, "..")) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad name");
     }
+    const char *problem = upload_name_problem(name);
+    if (problem) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, problem);
+    }
     /* IMAGE_A.CFG belongs to FlashFloppy: it writes the file itself,
      * and accepting an upload of it would fight the selection
      * mechanism. INIT_A.CFG is likewise refused (selection here is
      * IMAGE_A-based). FF.CFG / IMG.CFG are configuration and ARE
      * accepted, under their canonical uppercase names. */
-    static char canon[128];
     if (strcasecmp(name, "FF.CFG") == 0) {
-        strcpy(canon, "FF.CFG");
-        name = canon;
+        name = "FF.CFG";
     } else if (strcasecmp(name, "IMG.CFG") == 0) {
-        strcpy(canon, "IMG.CFG");
-        name = canon;
+        name = "IMG.CFG";
     } else if (strcasecmp(name, "IMAGE_A.CFG") == 0) {
         return httpd_resp_send_err(
             req, HTTPD_400_BAD_REQUEST,
@@ -355,11 +418,18 @@ static esp_err_t h_upload(httpd_req_t *req)
     g_ff.upload_active = false;
     ff_state_unlock();
     if (err != ESP_OK) {
+        ff_state_set_error("Upload of %.80s failed (card full, media "
+                           "error or connection lost)", name);
         return httpd_resp_send_err(req,
                                    HTTPD_500_INTERNAL_SERVER_ERROR,
-                                   "upload failed");
+                                   "upload failed - see status");
     }
-    return send_json(req, "{\"ok\":true}");
+    /* POWER.CFG / WIFI.CFG are read only at boot. */
+    bool needs_reboot = strcasecmp(name, "POWER.CFG") == 0 ||
+                        strcasecmp(name, "WIFI.CFG") == 0;
+    return send_json(req, needs_reboot
+                              ? "{\"ok\":true,\"reboot_needed\":true}"
+                              : "{\"ok\":true}");
 }
 
 esp_err_t ff_http_start(void)
@@ -388,6 +458,7 @@ esp_err_t ff_http_start(void)
         {.uri = "/api/select", .method = HTTP_POST, .handler = h_select},
         {.uri = "/api/eject", .method = HTTP_POST, .handler = h_eject},
         {.uri = "/api/reinsert", .method = HTTP_POST, .handler = h_reinsert},
+        {.uri = "/api/force", .method = HTTP_POST, .handler = h_force},
         {.uri = "/api/upload", .method = HTTP_POST, .handler = h_upload},
         {.uri = "/api/power", .method = HTTP_GET, .handler = h_power_get},
         {.uri = "/api/power", .method = HTTP_POST, .handler = h_power_post},

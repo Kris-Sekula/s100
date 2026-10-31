@@ -36,22 +36,35 @@ typedef struct {
 
 void ff_power_configure(const ff_power_cfg_t *cfg);
 bool ff_power_configured(void);
-const char *ff_power_name(void);
 
-/* Live query of the configured outlet's relay state. */
-esp_err_t ff_power_query(bool *on_out);
-esp_err_t ff_power_set(bool on);
-/* Background polling (v36): after ff_power_start_polling(), a
- * task re-reads the outlet every FF_POWER_POLL_MS — relay state
- * AND emeter watts — so flips made outside this UI (Kasa app,
- * another client, the physical button) show up on their own.
- * HTTP serves the cache, not the device. ff_power_cached_state()
- * returns false until the first successful poll lands. */
-void ff_power_start_polling(void);
-bool ff_power_cached_state(bool *on_out, float *watts_out,
-                           bool *reachable_out);
-/* Off, wait the configured delay, on — in a background task, so
- * HTTP handlers and swap completion never block on it. A second
- * request while one is running is ignored. */
+/* v39: nothing outside this module talks to the device directly.
+ * A worker task executes on/off/restart from a queue and a poll task
+ * keeps a cache of relay state + watts; HTTP handlers only queue
+ * commands and read the cache, so a slow or absent strip can never
+ * stall the web server. All device exchanges have hard timeouts
+ * (connect included). */
+typedef enum { FF_POWER_ON, FF_POWER_OFF, FF_POWER_RESTART } ff_power_cmd_t;
+
+/* Start the worker and the poller (no-op when not configured). */
+void ff_power_start(void);
+
+/* Queue a command. ESP_ERR_INVALID_STATE when not configured or a
+ * command is already queued/running (the UI shows it as busy). */
+esp_err_t ff_power_request(ff_power_cmd_t cmd);
+
+/* Restart (off, delay, on) after a swap; same as
+ * ff_power_request(FF_POWER_RESTART), result ignored. */
 void ff_power_restart_async(void);
-bool ff_power_restarting(void);
+
+typedef struct {
+    bool configured;
+    bool valid;      /* at least one poll has succeeded */
+    bool reachable;
+    bool on;
+    float watts;
+    bool busy;       /* a command is queued or running */
+    bool restarting; /* ...and it is a restart */
+    char name[32];
+    char error[96];  /* last failed command, "" if none */
+} ff_power_status_t;
+void ff_power_get_status(ff_power_status_t *out);

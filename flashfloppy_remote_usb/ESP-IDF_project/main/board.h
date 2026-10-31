@@ -49,7 +49,9 @@
 
 /* Swap idle thresholds from the 2026-10-27 design (heuristics: the ESP32
  * sees USB traffic, not the floppy bus). Swap only when the host is idle,
- * and reset the host after swapping a boot disk. */
+ * and reset the host after swapping a boot disk. Enforced by the apply
+ * task since v39, from MSC read/write stamps (sdcard.c); they were
+ * defined but unused in v15–v38. */
 #define FF_IDLE_WRITE_MS 5000
 #define FF_IDLE_READ_MS  2000
 #define FF_DISCONNECT_DWELL_MS 750 /* bench-verify: 500-1000 ms range */

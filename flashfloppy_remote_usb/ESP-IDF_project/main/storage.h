@@ -31,8 +31,15 @@ esp_err_t ff_store_prepare(void);
  * record, synced FROM the card so selections made on the Gotek's
  * own controls are learned too. Local window only. */
 esp_err_t ff_store_refresh(void);
+/* Snapshot accessors: call with ff_state_lock() HELD (v39) — a
+ * refresh publishes a new snapshot under that lock. */
 int ff_store_count(void);
 const ff_entry_t *ff_store_entry(int i);
+/* True if name is a selectable image in the snapshot (locks itself). */
+bool ff_store_has_image(const char *name);
+/* True for upload temporaries (*.part, *.prev): never listed, and
+ * refused as upload names. */
+bool ff_store_is_temp_name(const char *name);
 
 /* Write IMAGE_A.CFG naming rel — since v18 simply the image's
  * filename in the root (e.g. "disk.hfe"). Local window only. */
@@ -43,7 +50,8 @@ esp_err_t ff_store_write_image_a(const char *rel);
  * into place only when the stream completes cleanly, so an
  * interrupted upload never leaves a partial file FlashFloppy
  * could try to mount. Any size the card can hold. Ejected/local
- * state only. fill(ctx, buf, cap) returns >0 bytes read, 0 at
+ * state only. Replacing an existing file keeps the old copy (as
+ * <name>.prev) until the new one is in place (v39). fill(ctx, buf, cap) returns >0 bytes read, 0 at
  * end of body, <0 on error. */
 typedef int (*ff_fill_fn)(void *ctx, uint8_t *buf, size_t cap);
 esp_err_t ff_store_write_stream(const char *name, ff_fill_fn fill,

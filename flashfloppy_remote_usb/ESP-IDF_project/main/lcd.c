@@ -11,6 +11,8 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 /* ST7789 status display (v23 — the real driver; this file was a
  * stub through v22). The Waveshare ESP32-S3-LCD-1.47 panel is
@@ -39,6 +41,25 @@ static const char *TAG = "ff_lcd";
 
 static esp_lcd_panel_handle_t s_panel;
 static uint16_t *s_fb; /* PSRAM framebuffer, RGB565 byte-swapped */
+/* v39: render() is called from the apply task, the peek task and
+ * app_main — the v26 peek task made "never concurrently" untrue.
+ * s_lcd_lock serialises whole renders; s_flush_done lets a render
+ * wait until the previous frame's SPI DMA has finished reading
+ * s_fb before the framebuffer is overwritten. */
+static SemaphoreHandle_t s_lcd_lock;
+static SemaphoreHandle_t s_flush_done;
+
+static bool flush_done_cb(esp_lcd_panel_io_handle_t io,
+                          esp_lcd_panel_io_event_data_t *edata,
+                          void *ctx)
+{
+    (void)io;
+    (void)edata;
+    (void)ctx;
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(s_flush_done, &woken);
+    return woken == pdTRUE;
+}
 
 static void fb_fill(uint16_t col565)
 {
@@ -86,29 +107,44 @@ static int fb_text(int x, int y, const char *s, int scale,
 
 static void render(const char *title, const char *name)
 {
-    if (!s_panel || !s_fb) return;
+    if (!s_panel || !s_fb || !s_lcd_lock) return;
+    /* Copy the shared strings under the state lock first; callers
+     * never hold it when they ask for a repaint. */
+    char cur[256], ssid[33], ip[16];
+    ff_state_lock();
+    snprintf(cur, sizeof(cur), "%s", g_ff.current_path);
+    snprintf(ssid, sizeof(ssid), "%s", g_ff.wifi_ssid);
+    snprintf(ip, sizeof(ip), "%s", g_ff.wifi_ip);
+    g_ff.lcd_dirty = false;
+    ff_state_unlock();
+
+    xSemaphoreTake(s_lcd_lock, portMAX_DELAY);
+    /* Previous frame still being clocked out? Wait for it. */
+    xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(200));
     fb_fill(COL_BG);
     fb_text(6, 6, "FLASHFLOPPY", 1, COL_HDR, LCD_W - 12);
     fb_rect(6, 30, LCD_W - 12, 1, COL_DIM);
     fb_text(6, 40, title && title[0] ? title : "Presented", 1,
             COL_DIM, LCD_W - 12);
-    const char *nm = name && name[0] ? name
-                     : g_ff.current_path[0] ? g_ff.current_path
-                                            : "(none)";
+    const char *nm = name && name[0] ? name : cur[0] ? cur : "(none)";
     fb_text(6, 64, nm, 2, COL_NAME, LCD_W - 12);
     fb_rect(6, 246, LCD_W - 12, 1, COL_DIM);
     int y = 258;
-    if (g_ff.wifi_ssid[0]) {
+    if (ssid[0]) {
         char line[48];
-        snprintf(line, sizeof(line), "SSID: %s", g_ff.wifi_ssid);
+        snprintf(line, sizeof(line), "SSID: %s", ssid);
         y = fb_text(6, y, line, 1, COL_NET, LCD_W - 12);
         snprintf(line, sizeof(line), "IP: %s",
-                 g_ff.wifi_ip[0] ? g_ff.wifi_ip : "joining...");
+                 ip[0] ? ip : "joining...");
         fb_text(6, y + 6, line, 1, COL_NET, LCD_W - 12);
     } else {
         fb_text(6, y, "WiFi: starting", 1, COL_NET, LCD_W - 12);
     }
-    esp_lcd_panel_draw_bitmap(s_panel, 0, 0, LCD_W, LCD_H, s_fb);
+    if (esp_lcd_panel_draw_bitmap(s_panel, 0, 0, LCD_W, LCD_H, s_fb) !=
+        ESP_OK) {
+        xSemaphoreGive(s_flush_done); /* nothing in flight */
+    }
+    xSemaphoreGive(s_lcd_lock);
 }
 
 esp_err_t ff_lcd_init(void)
@@ -133,6 +169,10 @@ esp_err_t ff_lcd_init(void)
         ESP_LOGE(TAG, "SPI bus init failed: %s", esp_err_to_name(err));
         return err;
     }
+    s_lcd_lock = xSemaphoreCreateMutex();
+    s_flush_done = xSemaphoreCreateBinary();
+    if (!s_lcd_lock || !s_flush_done) return ESP_ERR_NO_MEM;
+    xSemaphoreGive(s_flush_done); /* no frame in flight yet */
     esp_lcd_panel_io_handle_t io;
     const esp_lcd_panel_io_spi_config_t io_cfg = {
         .cs_gpio_num = BOARD_LCD_CS_GPIO,
@@ -142,6 +182,7 @@ esp_err_t ff_lcd_init(void)
         .trans_queue_depth = 10,
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
+        .on_color_trans_done = flush_done_cb,
     };
     err = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST,
                                    &io_cfg, &io);
@@ -184,8 +225,7 @@ esp_err_t ff_lcd_init(void)
 void ff_lcd_show_status(const char *line1, const char *line2)
 {
     /* Full-screen re-render: title + big file name + the Wi-Fi
-     * footer from g_ff (ssid/ip fields, kept by main.c). Callers:
-     * app_main once after Wi-Fi is up, and the apply task after
-     * each window — never concurrently, so no lock is taken. */
+     * footer from g_ff. Safe from any task since v39 (see
+     * s_lcd_lock); must not be called with ff_state_lock held. */
     render(line1, line2);
 }

@@ -10,13 +10,18 @@
 #include <unistd.h> /* fsync() for the IMAGE_A.CFG write verify */
 #include <sys/stat.h>
 #include "esp_log.h"
-#include "nvs_flash.h"
+#include "util.h"
 
 static const char *TAG = "ff_store";
 
 #define FF_STORE_MAX_ENTRIES 64
+/* s_entries/s_entry_count are the published snapshot, guarded by
+ * ff_state_lock (v39: HTTP handlers used to read them while a
+ * refresh was rewriting them). A refresh scans into s_scan first and
+ * publishes under the lock in one copy. */
 static ff_entry_t s_entries[FF_STORE_MAX_ENTRIES];
 static int s_entry_count;
+static ff_entry_t s_scan[FF_STORE_MAX_ENTRIES];
 
 static bool is_config_name(const char *name)
 {
@@ -35,10 +40,21 @@ static bool is_backup_name(const char *name)
     return n > 4 && strcasecmp(name + n - 4, ".bak") == 0;
 }
 
-static bool is_partial_name(const char *name)
+static bool has_suffix(const char *name, const char *suffix)
 {
-    size_t n = strlen(name);
-    return n > 5 && strcasecmp(name + n - 5, ".part") == 0;
+    size_t n = strlen(name), k = strlen(suffix);
+    return n > k && strcasecmp(name + n - k, suffix) == 0;
+}
+
+/* Upload temporaries (v37 .part; v39 .prev = the old copy of a file
+ * being replaced, kept until the new one is safely in place). */
+#define FF_PART_SUFFIX ".part"
+#define FF_PREV_SUFFIX ".prev"
+
+bool ff_store_is_temp_name(const char *name)
+{
+    return has_suffix(name, FF_PART_SUFFIX) ||
+           has_suffix(name, FF_PREV_SUFFIX);
 }
 
 static bool file_exists(const char *path)
@@ -47,17 +63,6 @@ static bool file_exists(const char *path)
     return stat(path, &st) == 0;
 }
 
-/* Bounded copy, always NUL-terminating. snprintf(dst, cap, "%s",
- * src) into a smaller field trips -Werror=format-truncation when
- * GCC can bound the source (d_name is up to 255 bytes, the entry
- * name field is 160) — the v12/v13 lesson, applied here in v16. */
-static void copy_field(char *dst, size_t cap, const char *src)
-{
-    size_t n = strlen(src);
-    if (n > cap - 1) n = cap - 1;
-    memcpy(dst, src, n);
-    dst[n] = 0;
-}
 
 /* Make the root FF.CFG select via IMAGE_A.CFG. Kris's bench test
  * (2026-10-30): the explicit `image-on-startup = last` line is what
@@ -81,6 +86,7 @@ static void ensure_ff_cfg(void)
         return;
     }
     size_t len = fread(content, 1, sizeof(content) - 1, f);
+    bool truncated = len == sizeof(content) - 1 && fgetc(f) != EOF;
     fclose(f);
     content[len] = 0;
 
@@ -121,6 +127,15 @@ static void ensure_ff_cfg(void)
         }
         return;
     }
+    if (truncated) {
+        /* The setting may be past what we read; appending could
+         * duplicate it. Leave a very large FF.CFG alone. (v39) */
+        ESP_LOGW(TAG, "FF.CFG is larger than %u bytes and the first "
+                      "part has no image-on-startup line; not "
+                      "modifying it — make sure it says 'last'",
+                 (unsigned)sizeof(content) - 1);
+        return;
+    }
     f = fopen(FF_FF_CFG_PATH, "a");
     if (f) {
         fputs("\n# Added by the FlashFloppy ESP32 frontend: web "
@@ -140,44 +155,83 @@ esp_err_t ff_store_prepare(void)
     return ESP_OK;
 }
 
+/* Tidy upload leftovers (v37 .part, v39 .prev). Runs only while the
+ * card is locally mounted and no upload holds its claim, so anything
+ * found is stale. A .prev whose original is missing means a replace
+ * was cut off between its two renames: put the old copy back.
+ * Names are collected first and acted on after closedir — FatFs
+ * should not see renames while a directory scan is open. */
+static void cleanup_upload_leftovers(void)
+{
+    enum { MAX_FIX = 8 };
+    static char names[MAX_FIX][160];
+    int n = 0;
+    DIR *d = opendir(FF_SD_MOUNT_POINT);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL && n < MAX_FIX) {
+        if (ff_store_is_temp_name(e->d_name)) {
+            ff_copy_field(names[n++], sizeof(names[0]), e->d_name);
+        }
+    }
+    closedir(d);
+    for (int i = 0; i < n; i++) {
+        char path[420], orig[420];
+        snprintf(path, sizeof(path), "%s/%s", FF_SD_MOUNT_POINT,
+                 names[i]);
+        if (has_suffix(names[i], FF_PREV_SUFFIX)) {
+            snprintf(orig, sizeof(orig), "%s", path);
+            orig[strlen(orig) - strlen(FF_PREV_SUFFIX)] = 0;
+            if (!file_exists(orig) && rename(path, orig) == 0) {
+                ESP_LOGW(TAG, "restored %s from an interrupted "
+                              "replace", orig);
+                continue;
+            }
+        }
+        unlink(path);
+        ESP_LOGI(TAG, "removed stale upload temporary %s", names[i]);
+    }
+}
+
 esp_err_t ff_store_refresh(void)
 {
+    cleanup_upload_leftovers();
     /* Everything lives in the root (v18). IMAGE_A.CFG is FlashFloppy's
      * own state and WIFI.CFG is ours; neither is listed. Directories
      * and dotfiles (a card reader's housekeeping included) are
      * skipped by the regular-file and name checks. */
-    s_entry_count = 0;
+    int count = 0;
     DIR *d = opendir(FF_SD_MOUNT_POINT);
     if (d) {
         struct dirent *e;
-        while ((e = readdir(d)) != NULL &&
-               s_entry_count < FF_STORE_MAX_ENTRIES) {
+        while ((e = readdir(d)) != NULL && count < FF_STORE_MAX_ENTRIES) {
             if (e->d_name[0] == '.') continue;
             if (strcasecmp(e->d_name, "IMAGE_A.CFG") == 0 ||
                 strcasecmp(e->d_name, "WIFI.CFG") == 0) continue;
+            if (ff_store_is_temp_name(e->d_name)) continue;
             char path[420];
             snprintf(path, sizeof(path), "%s/%s", FF_SD_MOUNT_POINT,
                      e->d_name);
-            if (is_partial_name(e->d_name)) {
-                /* Leftover of an interrupted direct upload (v37):
-                 * never listed, and tidied away here — refresh only
-                 * runs while the card is locally mounted, and an
-                 * upload in progress holds its claim, so a .part
-                 * seen now is always stale. */
-                unlink(path);
-                continue;
-            }
             struct stat st;
             if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
-            ff_entry_t *en = &s_entries[s_entry_count++];
-            copy_field(en->name, sizeof(en->name), e->d_name);
+            ff_entry_t *en = &s_scan[count++];
+            ff_copy_field(en->name, sizeof(en->name), e->d_name);
             en->size = (uint32_t)st.st_size;
             en->kind = is_config_name(e->d_name) ? FF_KIND_CONFIG
                        : is_backup_name(e->d_name) ? FF_KIND_BACKUP
                                                    : FF_KIND_IMAGE;
         }
         closedir(d);
+        if (count == FF_STORE_MAX_ENTRIES) {
+            ESP_LOGW(TAG, "more than %d files on the card; the UI "
+                          "lists the first %d",
+                     FF_STORE_MAX_ENTRIES, FF_STORE_MAX_ENTRIES);
+        }
     }
+    ff_state_lock();
+    memcpy(s_entries, s_scan, (size_t)count * sizeof(s_scan[0]));
+    s_entry_count = count;
+    ff_state_unlock();
 
     /* Current image, straight from IMAGE_A.CFG: the shared truth
      * between us and FlashFloppy, whichever side changed it last.
@@ -216,14 +270,7 @@ esp_err_t ff_store_refresh(void)
     if (current[0]) {
         char path[420];
         snprintf(path, sizeof(path), "%s/%s", FF_SD_MOUNT_POINT, current);
-        if (file_exists(path)) {
-            nvs_handle_t nv;
-            if (nvs_open("ff", NVS_READWRITE, &nv) == ESP_OK) {
-                nvs_set_str(nv, "last", current);
-                nvs_commit(nv);
-                nvs_close(nv);
-            }
-        }
+        if (file_exists(path)) ff_nvs_save_last(current);
     }
     return ESP_OK;
 }
@@ -236,6 +283,18 @@ int ff_store_count(void)
 const ff_entry_t *ff_store_entry(int i)
 {
     return (i >= 0 && i < s_entry_count) ? &s_entries[i] : NULL;
+}
+
+bool ff_store_has_image(const char *name)
+{
+    bool ok = false;
+    ff_state_lock();
+    for (int i = 0; i < s_entry_count && !ok; i++) {
+        ok = s_entries[i].kind == FF_KIND_IMAGE &&
+             strcmp(s_entries[i].name, name) == 0;
+    }
+    ff_state_unlock();
+    return ok;
 }
 
 esp_err_t ff_store_write_image_a(const char *rel)
@@ -296,7 +355,7 @@ esp_err_t ff_store_write_stream(const char *name, ff_fill_fn fill,
     char target[420], part[440];
     snprintf(target, sizeof(target), "%s/%s", FF_SD_MOUNT_POINT,
              name);
-    snprintf(part, sizeof(part), "%s.part", target);
+    snprintf(part, sizeof(part), "%s" FF_PART_SUFFIX, target);
     FILE *f = fopen(part, "wb");
     if (!f) {
         ESP_LOGE(TAG, "upload: cannot create %s", part);
@@ -333,15 +392,35 @@ esp_err_t ff_store_write_stream(const char *name, ff_fill_fn fill,
                  name, (unsigned)total);
         return err;
     }
-    /* FatFs rename will not overwrite an existing file: clear the
-     * way first (the container-era lesson). */
-    unlink(target);
+    /* FatFs rename will not overwrite an existing file, so a
+     * replace takes two renames. v37 unlinked the old file first —
+     * and a failed rename then lost BOTH copies. v39 keeps the old
+     * one as <name>.prev until the new one is in place, restores it
+     * if the second rename fails, and refresh() finishes the job if
+     * power is lost in between. */
+    char prev[440];
+    snprintf(prev, sizeof(prev), "%s" FF_PREV_SUFFIX, target);
+    bool had_old = file_exists(target);
+    if (had_old) {
+        unlink(prev); /* stale leftover, if any */
+        if (rename(target, prev) != 0) {
+            unlink(part);
+            ESP_LOGE(TAG, "upload of %s: could not move the existing "
+                          "file aside; it is unchanged", name);
+            return ESP_FAIL;
+        }
+    }
     if (rename(part, target) != 0) {
+        if (had_old && rename(prev, target) != 0) {
+            ESP_LOGE(TAG, "upload of %s: restore failed; the old copy "
+                          "is %s", name, prev);
+        }
         unlink(part);
-        ESP_LOGE(TAG, "upload of %s: rename into place failed",
-                 name);
+        ESP_LOGE(TAG, "upload of %s: rename into place failed%s",
+                 name, had_old ? "; the old file was kept" : "");
         return ESP_FAIL;
     }
+    if (had_old) unlink(prev);
     if (written_out) *written_out = total;
     ESP_LOGI(TAG, "uploaded %s (%u bytes) directly to the card",
              name, (unsigned)total);

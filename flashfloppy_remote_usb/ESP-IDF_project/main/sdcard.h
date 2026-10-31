@@ -28,7 +28,6 @@ esp_err_t ff_sdcard_init(void);
 esp_err_t ff_usb_install(void);
 esp_err_t ff_sdcard_local_begin(void); /* pull from USB, mount locally */
 esp_err_t ff_sdcard_local_end(void);   /* unmount, hand back to USB */
-bool ff_sdcard_local_active(void);
 /* The raw card handle, for the storage layer's read-only sector
  * peek (v26). Callers must only ever READ through it, and only
  * while the card is with USB — never write, never during a local

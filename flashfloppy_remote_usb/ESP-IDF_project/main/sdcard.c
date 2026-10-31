@@ -1,6 +1,7 @@
 #include "sdcard.h"
 #include "board.h"
 #include "state.h"
+#include "util.h"
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h" /* vTaskDelay for the USB detach settle */
@@ -164,12 +165,52 @@ esp_err_t ff_sdcard_local_end(void)
     return ESP_OK;
 }
 
-bool ff_sdcard_local_active(void)
-{
-    return s_local;
-}
 
 sdmmc_card_t *ff_sdcard_handle(void)
 {
     return s_card;
+}
+
+/* ---- USB activity stamps for the swap idle check (v39) ----
+ *
+ * The esp_tinyusb storage component owns the TinyUSB MSC callbacks,
+ * so we cannot add code to them directly. Instead the linker wraps
+ * them (-Wl,--wrap=..., see main/CMakeLists.txt): TinyUSB's MSC
+ * class driver calls __wrap_tud_msc_*10_cb below, which stamps the
+ * time and forwards to the component's real callback. The stamps
+ * let the apply task hold a swap back while the Gotek is mid-write
+ * (FF_IDLE_WRITE_MS) or busy reading (FF_IDLE_READ_MS, capped by
+ * FF_SWAP_MAX_WAIT_MS). These run in the TinyUSB task: no locks, no
+ * logging, just two 32-bit stores. */
+int32_t __real_tud_msc_read10_cb(uint8_t lun, uint32_t lba,
+                                 uint32_t offset, void *buffer,
+                                 uint32_t bufsize);
+int32_t __real_tud_msc_write10_cb(uint8_t lun, uint32_t lba,
+                                  uint32_t offset, uint8_t *buffer,
+                                  uint32_t bufsize);
+int32_t __wrap_tud_msc_read10_cb(uint8_t lun, uint32_t lba,
+                                 uint32_t offset, void *buffer,
+                                 uint32_t bufsize);
+int32_t __wrap_tud_msc_write10_cb(uint8_t lun, uint32_t lba,
+                                  uint32_t offset, uint8_t *buffer,
+                                  uint32_t bufsize);
+
+int32_t __wrap_tud_msc_read10_cb(uint8_t lun, uint32_t lba,
+                                 uint32_t offset, void *buffer,
+                                 uint32_t bufsize)
+{
+    g_ff.last_msc_read_ms = ff_now_ms();
+    return __real_tud_msc_read10_cb(lun, lba, offset, buffer, bufsize);
+}
+
+int32_t __wrap_tud_msc_write10_cb(uint8_t lun, uint32_t lba,
+                                  uint32_t offset, uint8_t *buffer,
+                                  uint32_t bufsize)
+{
+    g_ff.last_msc_write_ms = ff_now_ms();
+    int32_t r = __real_tud_msc_write10_cb(lun, lba, offset, buffer,
+                                          bufsize);
+    /* Stamp again after: a slow SD write should count from its end. */
+    g_ff.last_msc_write_ms = ff_now_ms();
+    return r;
 }

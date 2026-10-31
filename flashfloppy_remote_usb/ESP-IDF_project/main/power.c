@@ -4,20 +4,35 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <fcntl.h>
 #include "esp_log.h"
-#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include "lwip/inet.h"
 #include "cJSON.h"
 
 static const char *TAG = "ff_power";
 
+#define KASA_IO_TIMEOUT_MS 2000
+/* Restart's "on" step: a single Wi-Fi hiccup must not leave the
+ * machine switched off (v39). */
+#define KASA_ON_ATTEMPTS  3
+#define KASA_OFF_ATTEMPTS 2
+#define KASA_RETRY_GAP_MS 2000
+
 static ff_power_cfg_t s_cfg;
 static bool s_configured;
-static SemaphoreHandle_t s_lock; /* serialises device exchanges */
+
+/* s_lock (recursive) guards every device exchange AND the outlet
+ * resolution below — v38 wrote s_child_* outside it, so the poll
+ * task, an HTTP-triggered set and the restart task could interleave
+ * and send a half-written child id. Held across a whole
+ * query-then-set sequence, hence recursive. */
+static SemaphoreHandle_t s_lock;
 static char s_child_id[64];      /* cached strip outlet id —
                                   * 42 chars (40 device + 2 suffix);
                                   * a 40-byte buffer silently
@@ -26,20 +41,29 @@ static char s_child_id[64];      /* cached strip outlet id —
 static bool s_child_resolved;
 static bool s_child_id_logged;
 static bool s_child_is_strip;    /* sysinfo had children */
-static volatile bool s_restarting;
-/* Poll cache (v36): written by the poll task (and by ff_power_set
- * for the relay bit), read by the HTTP handler. */
-static volatile bool s_cache_on, s_cache_reachable, s_cache_valid;
-static volatile float s_cache_watts;
-static bool s_poll_started;
 /* Set under s_lock for the duration of an exchange: the poll
  * task's routine exchanges stay silent so a strip that is merely
  * off-network doesn't spam the console every poll. */
 static bool s_quiet;
 
+/* s_stat_lock guards the cache the HTTP handler reads, plus the
+ * busy/error fields. Never held across network I/O. */
+static SemaphoreHandle_t s_stat_lock;
+static ff_power_status_t s_stat;
+
+static QueueHandle_t s_queue;
+static bool s_started;
+
+static void stat_lock(void) { xSemaphoreTake(s_stat_lock, portMAX_DELAY); }
+static void stat_unlock(void) { xSemaphoreGive(s_stat_lock); }
+
+static void dev_lock(void) { xSemaphoreTakeRecursive(s_lock, portMAX_DELAY); }
+static void dev_unlock(void) { xSemaphoreGiveRecursive(s_lock); }
+
 void ff_power_configure(const ff_power_cfg_t *cfg)
 {
-    if (!s_lock) s_lock = xSemaphoreCreateMutex();
+    if (!s_lock) s_lock = xSemaphoreCreateRecursiveMutex();
+    if (!s_stat_lock) s_stat_lock = xSemaphoreCreateMutex();
     s_cfg = *cfg;
     if (!s_cfg.port) s_cfg.port = 9999;
     if (!s_cfg.outlet) s_cfg.outlet = 1;
@@ -57,8 +81,6 @@ void ff_power_configure(const ff_power_cfg_t *cfg)
 }
 
 bool ff_power_configured(void) { return s_configured; }
-const char *ff_power_name(void) { return s_cfg.name; }
-bool ff_power_restarting(void) { return s_restarting; }
 
 /* The Kasa autokey XOR: key starts at 171; each byte is XORed with
  * the running key, which then becomes the cipher byte just
@@ -86,38 +108,79 @@ static void kasa_crypt(const uint8_t *in, uint8_t *out, size_t len,
     }
 }
 
+/* connect() with a hard timeout: non-blocking connect, then select()
+ * for writability, then SO_ERROR for the outcome. Leaves the socket
+ * blocking again (with the SO_*TIMEO bounds) on success. */
+static int connect_timeout(int sock, const struct sockaddr *sa,
+                           socklen_t len, int timeout_ms)
+{
+    int fl = fcntl(sock, F_GETFL, 0);
+    if (fl < 0 || fcntl(sock, F_SETFL, fl | O_NONBLOCK) < 0) return -1;
+    int r = connect(sock, sa, len);
+    if (r != 0) {
+        if (errno != EINPROGRESS) return -1;
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(sock, &wfds);
+        struct timeval tv = {.tv_sec = timeout_ms / 1000,
+                             .tv_usec = (timeout_ms % 1000) * 1000};
+        r = select(sock + 1, NULL, &wfds, NULL, &tv);
+        if (r <= 0) {
+            if (r == 0) errno = ETIMEDOUT;
+            return -1;
+        }
+        int soerr = 0;
+        socklen_t sl = sizeof(soerr);
+        if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &soerr, &sl) != 0) {
+            return -1;
+        }
+        if (soerr) {
+            errno = soerr;
+            return -1;
+        }
+    }
+    return fcntl(sock, F_SETFL, fl) < 0 ? -1 : 0;
+}
+
 /* Send one JSON command, return the malloc'd NUL-terminated JSON
- * reply (caller frees), or NULL on any failure. Timeouts are short:
- * this runs on a LAN and one caller is an HTTP handler. */
+ * reply (caller frees), or NULL on any failure. Every step has a
+ * KASA_IO_TIMEOUT_MS bound. Call with s_lock held. */
 static char *kasa_exchange(const char *request)
 {
     char *result = NULL;
-    struct addrinfo hints = {0}, *res = NULL;
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    char port_str[8];
-    snprintf(port_str, sizeof(port_str), "%d", s_cfg.port);
-    if (getaddrinfo(s_cfg.host, port_str, &hints, &res) != 0 || !res) {
-        if (!s_quiet) ESP_LOGW(TAG, "cannot resolve %s", s_cfg.host);
-        return NULL;
-    }
-    int sock = socket(res->ai_family, res->ai_socktype, 0);
-    if (sock < 0) {
+    struct sockaddr_in sa = {0};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)s_cfg.port);
+    /* An IP literal (the usual POWER.CFG form) needs no DNS at all;
+     * only a hostname goes through the resolver. */
+    if (inet_pton(AF_INET, s_cfg.host, &sa.sin_addr) != 1) {
+        struct addrinfo hints = {0}, *res = NULL;
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(s_cfg.host, NULL, &hints, &res) != 0 || !res) {
+            if (!s_quiet) ESP_LOGW(TAG, "cannot resolve %s", s_cfg.host);
+            return NULL;
+        }
+        sa.sin_addr = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
         freeaddrinfo(res);
-        return NULL;
     }
-    struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return NULL;
+    struct timeval tv = {.tv_sec = KASA_IO_TIMEOUT_MS / 1000,
+                         .tv_usec = (KASA_IO_TIMEOUT_MS % 1000) * 1000};
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
+    /* SO_SNDTIMEO does not bound connect() in lwIP: an absent strip
+     * used to hold the caller for the full TCP SYN retry cycle
+     * (tens of seconds). Bounded explicitly since v39. */
+    if (connect_timeout(sock, (struct sockaddr *)&sa, sizeof(sa),
+                        KASA_IO_TIMEOUT_MS) != 0) {
         if (!s_quiet)
             ESP_LOGW(TAG, "connect to %s:%d failed (errno %d: %s)",
                      s_cfg.host, s_cfg.port, errno, strerror(errno));
-        freeaddrinfo(res);
         close(sock);
         return NULL;
     }
-    freeaddrinfo(res);
 
     size_t qlen = strlen(request);
     uint8_t *frame = malloc(qlen + 4);
@@ -189,25 +252,21 @@ static char *kasa_exchange(const char *request)
     return result;
 }
 
-/* Run an exchange under the module lock. quiet=true silences the
- * per-failure logs (the background poller logs transitions
- * itself, once, instead of every retry). */
+/* Run an exchange under the device lock. quiet=true silences the
+ * per-failure logs (the background poller logs transitions itself,
+ * once, instead of every retry). */
 static char *exchange_locked_q(const char *request, bool quiet)
 {
-    xSemaphoreTake(s_lock, portMAX_DELAY);
+    dev_lock();
+    bool was_quiet = s_quiet;
     s_quiet = quiet;
     char *r = kasa_exchange(request);
-    s_quiet = false;
-    xSemaphoreGive(s_lock);
+    s_quiet = was_quiet;
+    dev_unlock();
     return r;
 }
 
-static char *exchange_locked(const char *request)
-{
-    return exchange_locked_q(request, false);
-}
-
-/* get_sysinfo, and from it resolve (once) which child we control. */
+/* get_sysinfo; returns the parsed root (caller deletes). */
 static cJSON *get_sysinfo(bool quiet)
 {
     char *resp = exchange_locked_q(
@@ -232,14 +291,20 @@ static cJSON *get_sysinfo(bool quiet)
         cJSON_Delete(root);
         return NULL;
     }
-    return root; /* caller deletes root; sys borrows from it */
+    return root;
 }
 
+/* Query relay state and (re)resolve which child we control. The
+ * whole thing runs under the device lock. */
 static esp_err_t query_impl(bool quiet, bool *on_out)
 {
     if (!s_configured) return ESP_ERR_INVALID_STATE;
+    dev_lock();
     cJSON *root = get_sysinfo(quiet);
-    if (!root) return ESP_FAIL;
+    if (!root) {
+        dev_unlock();
+        return ESP_FAIL;
+    }
     cJSON *sys = cJSON_GetObjectItem(
         cJSON_GetObjectItem(root, "system"), "get_sysinfo");
     cJSON *children = cJSON_GetObjectItem(sys, "children");
@@ -249,19 +314,21 @@ static esp_err_t query_impl(bool quiet, bool *on_out)
         static bool sysinfo_logged;
         if (!sysinfo_logged) {
             sysinfo_logged = true;
+            const char *model = cJSON_GetStringValue(
+                cJSON_GetObjectItem(sys, "model"));
+            const char *sw = cJSON_GetStringValue(
+                cJSON_GetObjectItem(sys, "sw_ver"));
+            const char *hw = cJSON_GetStringValue(
+                cJSON_GetObjectItem(sys, "hw_ver"));
             ESP_LOGI(TAG, "device: %s, sw %s, hw %s",
-                     cJSON_GetStringValue(
-                         cJSON_GetObjectItem(sys, "model")),
-                     cJSON_GetStringValue(
-                         cJSON_GetObjectItem(sys, "sw_ver")),
-                     cJSON_GetStringValue(
-                         cJSON_GetObjectItem(sys, "hw_ver")));
+                     model ? model : "?", sw ? sw : "?", hw ? hw : "?");
         }
         int idx = s_cfg.outlet - 1;
         cJSON *child = cJSON_GetArrayItem(children, idx);
         if (!child) {
-            ESP_LOGE(TAG, "outlet %d out of range (strip has %d)",
-                     s_cfg.outlet, cJSON_GetArraySize(children));
+            if (!quiet)
+                ESP_LOGE(TAG, "outlet %d out of range (strip has %d)",
+                         s_cfg.outlet, cJSON_GetArraySize(children));
             err = ESP_ERR_NOT_FOUND;
         } else {
             cJSON *st = cJSON_GetObjectItem(child, "state");
@@ -294,85 +361,106 @@ static esp_err_t query_impl(bool quiet, bool *on_out)
         }
     }
     cJSON_Delete(root);
+    dev_unlock();
     return err;
 }
 
-esp_err_t ff_power_query(bool *on_out)
+/* Request object addressed at our outlet: a strip needs the child
+ * context, a single plug does not. Call under the device lock. */
+static cJSON *new_addressed_request(void)
 {
-    return query_impl(false, on_out);
-}
-
-esp_err_t ff_power_set(bool on)
-{
-    if (!s_configured) return ESP_ERR_INVALID_STATE;
-    if (!s_child_resolved) {
-        bool dummy;
-        if (ff_power_query(&dummy) != ESP_OK) return ESP_FAIL;
-    }
     cJSON *root = cJSON_CreateObject();
     /* Context FIRST, then the module — byte-identical to the
      * request python-kasa sent successfully against Kris's strip
-     * (captured 2026-10-30, err_code 0). Two bugs were stacked:
-     * v28–v33 also truncated the child id (see s_child_id), so the
-     * v33 experiment that swapped this order could not show an
-     * effect — both variants failed on the truncated id alone.
-     * With the id fixed, this order is the proven one. */
+     * (captured 2026-10-30, err_code 0). */
     if (s_child_is_strip) {
         cJSON *ctx = cJSON_AddObjectToObject(root, "context");
         cJSON *ids = cJSON_AddArrayToObject(ctx, "child_ids");
         cJSON_AddItemToArray(ids, cJSON_CreateString(s_child_id));
     }
+    return root;
+}
+
+static void cache_set_on(bool on)
+{
+    stat_lock();
+    s_stat.on = on;
+    stat_unlock();
+}
+
+/* One set_relay_state, resolving the outlet first if needed. The
+ * device lock is held across resolve + set. */
+static esp_err_t power_set_once(bool on)
+{
+    if (!s_configured) return ESP_ERR_INVALID_STATE;
+    dev_lock();
+    if (!s_child_resolved) {
+        bool dummy;
+        if (query_impl(false, &dummy) != ESP_OK) {
+            dev_unlock();
+            return ESP_FAIL;
+        }
+    }
+    cJSON *root = new_addressed_request();
     cJSON *sys = cJSON_AddObjectToObject(root, "system");
     cJSON *cmd = cJSON_AddObjectToObject(sys, "set_relay_state");
     cJSON_AddNumberToObject(cmd, "state", on ? 1 : 0);
     char *req = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
-    if (!req) return ESP_ERR_NO_MEM;
-    char *resp = exchange_locked(req);
+    if (!req) {
+        dev_unlock();
+        return ESP_ERR_NO_MEM;
+    }
+    char *resp = exchange_locked_q(req, false);
+    esp_err_t err = ESP_FAIL;
     if (!resp) {
         ESP_LOGE(TAG, "set_relay_state: no reply to request %s", req);
-        free(req);
-        return ESP_FAIL;
+    } else {
+        cJSON *rroot = cJSON_Parse(resp);
+        if (rroot) {
+            cJSON *rc = cJSON_GetObjectItem(
+                cJSON_GetObjectItem(
+                    cJSON_GetObjectItem(rroot, "system"),
+                    "set_relay_state"),
+                "err_code");
+            if (cJSON_IsNumber(rc) && rc->valueint == 0) err = ESP_OK;
+            cJSON_Delete(rroot);
+        }
+        if (err != ESP_OK) {
+            /* Show the device's actual answer — an err_code or an
+             * error object names what it objected to. */
+            ESP_LOGE(TAG, "set_relay_state reply: %.200s", resp);
+        }
+        free(resp);
     }
     free(req);
-    cJSON *rroot = cJSON_Parse(resp);
-    esp_err_t err = ESP_FAIL;
-    if (rroot) {
-        cJSON *rc = cJSON_GetObjectItem(
-            cJSON_GetObjectItem(
-                cJSON_GetObjectItem(rroot, "system"),
-                "set_relay_state"),
-            "err_code");
-        if (cJSON_IsNumber(rc) && rc->valueint == 0) err = ESP_OK;
-        cJSON_Delete(rroot);
-    }
     if (err != ESP_OK) {
-        /* Show the device's actual answer — an err_code or an
-         * error object names what it objected to. */
-        ESP_LOGE(TAG, "set_relay_state reply: %.200s", resp);
-    }
-    free(resp);
-    if (err == ESP_OK) {
-        /* Keep the poll cache truthful without waiting a cycle. */
-        s_cache_on = on;
-        ESP_LOGI(TAG, "%s outlet %d -> %s", s_cfg.name, s_cfg.outlet,
-                 on ? "ON" : "OFF");
-    } else {
         /* A failed set often means the strip renumbered children;
          * drop the cached id so the next call re-resolves. */
         s_child_resolved = false;
-        ESP_LOGE(TAG, "set_relay_state(%d) failed", on);
+    }
+    dev_unlock();
+    if (err == ESP_OK) {
+        cache_set_on(on); /* truthful without waiting a poll cycle */
+        ESP_LOGI(TAG, "%s outlet %d -> %s", s_cfg.name, s_cfg.outlet,
+                 on ? "ON" : "OFF");
     }
     return err;
 }
 
-bool ff_power_cached_state(bool *on_out, float *watts_out,
-                           bool *reachable_out)
+static esp_err_t power_set_retry(bool on, int attempts)
 {
-    if (on_out) *on_out = s_cache_on;
-    if (watts_out) *watts_out = s_cache_watts;
-    if (reachable_out) *reachable_out = s_cache_reachable;
-    return s_cache_valid;
+    esp_err_t err = ESP_FAIL;
+    for (int i = 0; i < attempts; i++) {
+        if (i) {
+            ESP_LOGW(TAG, "power %s: retry %d of %d", on ? "on" : "off",
+                     i + 1, attempts);
+            vTaskDelay(pdMS_TO_TICKS(KASA_RETRY_GAP_MS));
+        }
+        err = power_set_once(on);
+        if (err == ESP_OK) break;
+    }
+    return err;
 }
 
 /* One background poll: relay state from sysinfo, watts from the
@@ -382,21 +470,23 @@ bool ff_power_cached_state(bool *on_out, float *watts_out,
 static bool poll_once(void)
 {
     bool on = false;
+    dev_lock();
     if (query_impl(true, &on) != ESP_OK) {
-        if (s_cache_reachable) {
+        dev_unlock();
+        stat_lock();
+        bool was = s_stat.reachable;
+        s_stat.reachable = false;
+        stat_unlock();
+        if (was) {
             ESP_LOGW(TAG, "power strip at %s became unreachable",
                      s_cfg.host);
         }
-        s_cache_reachable = false;
         return false;
     }
-    float watts = s_cache_watts; /* keep last if emeter fails */
-    cJSON *root = cJSON_CreateObject();
-    if (s_child_is_strip) {
-        cJSON *ctx = cJSON_AddObjectToObject(root, "context");
-        cJSON *ids = cJSON_AddArrayToObject(ctx, "child_ids");
-        cJSON_AddItemToArray(ids, cJSON_CreateString(s_child_id));
-    }
+    stat_lock();
+    float watts = s_stat.watts; /* keep last if emeter fails */
+    stat_unlock();
+    cJSON *root = new_addressed_request();
     cJSON *em = cJSON_AddObjectToObject(root, "emeter");
     cJSON_AddObjectToObject(em, "get_realtime");
     char *req = cJSON_PrintUnformatted(root);
@@ -421,13 +511,16 @@ static bool poll_once(void)
             }
         }
     }
-    bool was_reachable = s_cache_reachable;
-    bool had = s_cache_valid;
-    bool prev_on = s_cache_on;
-    s_cache_on = on;
-    s_cache_watts = watts;
-    s_cache_reachable = true;
-    s_cache_valid = true;
+    dev_unlock();
+    stat_lock();
+    bool was_reachable = s_stat.reachable;
+    bool had = s_stat.valid;
+    bool prev_on = s_stat.on;
+    s_stat.on = on;
+    s_stat.watts = watts;
+    s_stat.reachable = true;
+    s_stat.valid = true;
+    stat_unlock();
     if (!was_reachable) {
         ESP_LOGI(TAG, "power strip reachable: %s outlet %d %s, "
                       "%.1f W",
@@ -454,44 +547,112 @@ static void poll_task(void *arg)
     }
 }
 
-void ff_power_start_polling(void)
+static void set_error(const char *msg)
 {
-    if (s_poll_started || !s_configured) return;
-    s_poll_started = true;
-    /* Same sizing as the restart task: two exchanges + cJSON on a
-     * full sysinfo every cycle. */
+    stat_lock();
+    snprintf(s_stat.error, sizeof(s_stat.error), "%s", msg);
+    stat_unlock();
+    if (msg[0]) ESP_LOGE(TAG, "%s", msg);
+}
+
+/* Executes queued commands one at a time. */
+static void worker_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        ff_power_cmd_t cmd;
+        if (xQueueReceive(s_queue, &cmd, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        char msg[96];
+        msg[0] = 0;
+        if (cmd == FF_POWER_ON) {
+            if (power_set_retry(true, KASA_ON_ATTEMPTS) != ESP_OK) {
+                snprintf(msg, sizeof(msg), "Power on failed - %.60s did "
+                         "not answer", s_cfg.host);
+            }
+        } else if (cmd == FF_POWER_OFF) {
+            if (power_set_retry(false, KASA_OFF_ATTEMPTS) != ESP_OK) {
+                snprintf(msg, sizeof(msg), "Power off failed - %.60s did "
+                         "not answer", s_cfg.host);
+            }
+        } else {
+            ESP_LOGI(TAG, "restarting %s: off, %d s, on", s_cfg.name,
+                     s_cfg.delay_s);
+            if (power_set_retry(false, KASA_OFF_ATTEMPTS) != ESP_OK) {
+                snprintf(msg, sizeof(msg), "Restart aborted: power off "
+                         "failed (machine left as it was)");
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(s_cfg.delay_s * 1000));
+                if (power_set_retry(true, KASA_ON_ATTEMPTS) != ESP_OK) {
+                    snprintf(msg, sizeof(msg), "Restart: power ON "
+                             "failed after %d tries - machine is OFF",
+                             KASA_ON_ATTEMPTS);
+                } else {
+                    ESP_LOGI(TAG, "restart of %s complete", s_cfg.name);
+                }
+            }
+        }
+        set_error(msg);
+        stat_lock();
+        s_stat.busy = false;
+        s_stat.restarting = false;
+        stat_unlock();
+    }
+}
+
+void ff_power_start(void)
+{
+    if (s_started || !s_configured) return;
+    s_queue = xQueueCreate(1, sizeof(ff_power_cmd_t));
+    if (!s_queue) return;
+    s_started = true;
+    /* Socket exchanges + cJSON on a 2 KB sysinfo: 6144, not the
+     * 4096 that has overflowed twice elsewhere in this project. */
+    xTaskCreate(worker_task, "ff_pwr", 6144, NULL, 4, NULL);
     xTaskCreate(poll_task, "ff_pwr_poll", 6144, NULL, 4, NULL);
 }
 
-static void restart_task(void *arg)
+esp_err_t ff_power_request(ff_power_cmd_t cmd)
 {
-    (void)arg;
-    ESP_LOGI(TAG, "restarting %s: off, %d s, on", s_cfg.name,
-             s_cfg.delay_s);
-    bool ok = ff_power_set(false) == ESP_OK;
-    if (ok) {
-        vTaskDelay(pdMS_TO_TICKS(s_cfg.delay_s * 1000));
-        ok = ff_power_set(true) == ESP_OK;
+    if (!s_configured || !s_started) return ESP_ERR_INVALID_STATE;
+    /* Check-and-set of busy under the lock: two callers (HTTP task,
+     * apply task) can never both queue. */
+    stat_lock();
+    if (s_stat.busy) {
+        stat_unlock();
+        return ESP_ERR_INVALID_STATE;
     }
-    if (ok) {
-        ESP_LOGI(TAG, "restart of %s complete", s_cfg.name);
-    } else {
-        ESP_LOGE(TAG, "restart of %s aborted: a power command "
-                      "failed, check the outlet state manually",
-                 s_cfg.name);
+    s_stat.busy = true;
+    s_stat.restarting = cmd == FF_POWER_RESTART;
+    s_stat.error[0] = 0;
+    stat_unlock();
+    if (xQueueSend(s_queue, &cmd, 0) != pdTRUE) {
+        stat_lock();
+        s_stat.busy = false;
+        s_stat.restarting = false;
+        stat_unlock();
+        return ESP_ERR_INVALID_STATE;
     }
-    s_restarting = false;
-    vTaskDelete(NULL);
+    return ESP_OK;
 }
 
 void ff_power_restart_async(void)
 {
-    if (!s_configured || s_restarting) return;
-    s_restarting = true;
-    /* Socket exchanges + cJSON on a 2 KB sysinfo: 6144, not the
-     * 4096 that has overflowed twice elsewhere in this project. */
-    if (xTaskCreate(restart_task, "ff_pwr", 6144, NULL, 4, NULL) !=
-        pdPASS) {
-        s_restarting = false;
+    if (ff_power_request(FF_POWER_RESTART) != ESP_OK) {
+        ESP_LOGW(TAG, "restart-after-swap skipped: power control "
+                      "busy or not configured");
     }
+}
+
+void ff_power_get_status(ff_power_status_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->configured = s_configured;
+    if (!s_configured || !s_stat_lock) return;
+    stat_lock();
+    *out = s_stat;
+    stat_unlock();
+    out->configured = true;
+    snprintf(out->name, sizeof(out->name), "%s", s_cfg.name);
 }

@@ -176,6 +176,21 @@ The card briefly disconnects and reconnects (about a second) while the
 selection is applied — the same thing that happens when you re-insert a
 physical stick — and FlashFloppy mounts the chosen image.
 
+**Waiting for the drive to go quiet** — Select, Re-insert and Eject
+don't pull the card while the Gotek is using it. A swap waits until
+nothing has been written for 5 seconds and nothing read for 2 seconds;
+a steady trickle of reads delays it by at most 6 seconds, but writes
+are never interrupted on their own. While it waits, the page says so
+and offers **Force now** — use it only when you know nothing is being
+written to the disk image (forcing mid-write can lose that write).
+The thresholds are `FF_IDLE_WRITE_MS`, `FF_IDLE_READ_MS` and
+`FF_SWAP_MAX_WAIT_MS` in `board.h`.
+
+**Errors** — if something fails (the card can't be handed back,
+`IMAGE_A.CFG` can't be written, an upload fails, the device refuses a
+request because another one is running), a red line under the status
+says what happened. The next request clears it.
+
 **Uploading**
 
 Uploads write directly to the card, so the drive must be **ejected**
@@ -187,10 +202,14 @@ while it transfers, and **Done** beside the button when it lands; the
 new file appears in the library list straight away. Uploads go to a
 temporary name first and are renamed into place only on a clean
 finish, so an interrupted transfer never leaves a partial file
-behind. When you're done, **Re-insert card** hands the drive back
+behind. Uploading a file that already exists replaces it safely: the
+old copy is kept until the new one is in place, and is restored if
+anything goes wrong. File names FAT can't store (`< > : " | ? *`) are
+refused with a message. When you're done, **Re-insert card** hands the drive back
 to the Gotek.
 `FF.CFG` and `IMG.CFG` may be uploaded; `IMAGE_A.CFG` is refused,
-because FlashFloppy owns it.
+because FlashFloppy owns it. `POWER.CFG` and `WIFI.CFG` are read only
+at boot: after uploading one, power-cycle the dongle to apply it.
 
 **Re-insert card** — runs a disconnect/edit/reconnect cycle without
 changing the selection, and hands the card back after an eject.
@@ -202,7 +221,10 @@ also the state uploads happen in.
 **Machine power** (only when `POWER.CFG` exists on the card) — shows the
 outlet's live state and power draw with **Power on**, **Power off**, and
 **Restart** buttons. Restart turns the outlet off, waits the configured
-delay, and turns it back on.
+delay, and turns it back on (retrying the "on" up to three times, so a
+single Wi-Fi hiccup can't leave the machine off). Commands run in the
+background, so a strip that is slow or offline never freezes the page;
+a failed command shows in red under the power state.
 
 **LCD** — shows the presented file name, SSID, and IP address, updated on
 every change, including selections made on the Gotek itself.
@@ -226,6 +248,10 @@ Uploads use the same ownership rule from the other side: **Eject**
 leaves the card detached and locally mounted, and in that state an
 upload streams straight to the card — no intermediary, no size limit
 but free space. Re-insert hands the card back when you're done.
+
+The firmware also watches USB traffic (it wraps TinyUSB's MSC read and
+write callbacks at link time) so that a local window never starts while
+the Gotek is writing — see *Waiting for the drive to go quiet*.
 
 Because reading is not writing, one exception is safe: a background task
 polls `IMAGE_A.CFG` every few seconds by reading raw sectors (never
@@ -262,6 +288,7 @@ main/
   power.c        TP-Link Kasa outlet control (POWER.CFG)
   font.h         generated 10x18 font (DejaVu Sans Mono)
   state.c/h      shared state
+  util.c/h       small shared helpers (string copy, NVS record, clock)
   board.h        pin map and tunables
 ```
 

@@ -22,3 +22,12 @@ CONFIG_ESP_CONSOLE_UART_CUSTOM=y
 CONFIG_ESP_CONSOLE_UART_CUSTOM_NUM_0=y
 CONFIG_ESP_CONSOLE_UART_CUSTOM_TX_GPIO=3
 CONFIG_ESP_CONSOLE_UART_CUSTOM_RX_GPIO=2
+
+# v39: the Waveshare ESP32-S3-LCD-1.47 has 16 MB flash, but without
+# these lines the build assumes 2 MB with a 1 MB app partition — and
+# the firmware is already ~98% of that. The "large" single-app table
+# gives the app 1.5 MB; NVS stays at the same offset, so the saved
+# last-used image survives the change. (As above: only applies when
+# there is no sdkconfig yet — or set both in idf.py menuconfig.)
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y

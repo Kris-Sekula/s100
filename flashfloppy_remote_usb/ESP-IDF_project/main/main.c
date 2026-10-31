@@ -5,6 +5,7 @@
 #include "power.h"
 #include "http_server.h"
 #include "lcd.h"
+#include "util.h"
 #include <stdio.h>  /* snprintf() */
 #include <stdlib.h> /* atoi() for the POWER.CFG parser */
 #include <string.h>
@@ -15,6 +16,7 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "nvs_flash.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -56,40 +58,30 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
                 (wifi_event_sta_disconnected_t *)data;
             ESP_LOGW(TAG, "home Wi-Fi disconnected (reason %d); "
                           "retrying", d ? d->reason : -1);
+            /* v39: the old address is no longer ours — don't keep
+             * showing it in the UI status or on the LCD. */
+            ff_state_lock();
+            bool had_ip = g_ff.wifi_ip[0] != 0;
+            g_ff.wifi_ip[0] = 0;
+            snprintf(g_ff.wifi_desc, sizeof(g_ff.wifi_desc),
+                     "sta joining");
+            if (had_ip) g_ff.lcd_dirty = true;
+            ff_state_unlock();
+            if (had_ip) ff_apply_kick(); /* repaint the footer */
             esp_wifi_connect();
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
         char ip[16];
         snprintf(ip, sizeof(ip), IPSTR, IP2STR(&e->ip_info.ip));
+        ff_state_lock();
         snprintf(g_ff.wifi_desc, sizeof(g_ff.wifi_desc), "sta %s", ip);
         snprintf(g_ff.wifi_ip, sizeof(g_ff.wifi_ip), "%s", ip);
+        g_ff.lcd_dirty = true;
+        ff_state_unlock();
+        ff_apply_kick();
         ESP_LOGI(TAG, "joined home Wi-Fi, web UI at http://%s/", ip);
         xEventGroupSetBits(s_wifi_evt, WIFI_GOT_IP_BIT);
-    }
-}
-
-/* Bounded string copy that always NUL-terminates. Used instead of
- * snprintf(dst, cap, "%s", src): with a 64-byte source buffer and a
- * 32-byte Wi-Fi SSID field, GCC's -Werror=format-truncation rejects
- * the snprintf form even though it would be safe (Kris's v12 build). */
-static void copy_field(char *dst, size_t cap, const char *src)
-{
-    size_t n = strlen(src);
-    if (n > cap - 1) n = cap - 1;
-    memcpy(dst, src, n);
-    dst[n] = 0;
-}
-
-static void trim(char *s)
-{
-    char *p = s;
-    while (*p == ' ' || *p == '\t') p++;
-    if (p != s) memmove(s, p, strlen(p) + 1);
-    size_t n = strlen(s);
-    while (n && (s[n - 1] == ' ' || s[n - 1] == '\t' ||
-                 s[n - 1] == '\r' || s[n - 1] == '\n')) {
-        s[--n] = 0;
     }
 }
 
@@ -106,14 +98,14 @@ static bool read_sta_cfg(sta_cfg_t *cfg)
         if (!eq) continue;
         *eq = 0;
         char *key = line, *val = eq + 1;
-        trim(key);
-        trim(val);
+        ff_trim(key);
+        ff_trim(val);
         if (strcasecmp(key, "ssid") == 0) {
-            copy_field(cfg->ssid, sizeof(cfg->ssid), val);
+            ff_copy_field(cfg->ssid, sizeof(cfg->ssid), val);
         } else if (strcasecmp(key, "password") == 0) {
-            copy_field(cfg->pass, sizeof(cfg->pass), val);
+            ff_copy_field(cfg->pass, sizeof(cfg->pass), val);
         } else if (strcasecmp(key, "mode") == 0) {
-            copy_field(cfg->mode, sizeof(cfg->mode), val);
+            ff_copy_field(cfg->mode, sizeof(cfg->mode), val);
         }
     }
     fclose(f);
@@ -134,10 +126,10 @@ static void read_power_cfg(void)
         if (!eq) continue;
         *eq = 0;
         char *key = line, *val = eq + 1;
-        trim(key);
-        trim(val);
+        ff_trim(key);
+        ff_trim(val);
         if (strcasecmp(key, "host") == 0) {
-            copy_field(cfg.host, sizeof(cfg.host), val);
+            ff_copy_field(cfg.host, sizeof(cfg.host), val);
         } else if (strcasecmp(key, "port") == 0) {
             cfg.port = atoi(val);
         } else if (strcasecmp(key, "outlet") == 0) {
@@ -145,7 +137,7 @@ static void read_power_cfg(void)
         } else if (strcasecmp(key, "delay") == 0) {
             cfg.delay_s = atoi(val);
         } else if (strcasecmp(key, "name") == 0) {
-            copy_field(cfg.name, sizeof(cfg.name), val);
+            ff_copy_field(cfg.name, sizeof(cfg.name), val);
         }
     }
     fclose(f);
@@ -190,8 +182,8 @@ static void wifi_init(void)
     if (read_sta_cfg(&sc)) {
         esp_netif_create_default_wifi_sta();
         wifi_config_t sta = {0};
-        copy_field((char *)sta.sta.ssid, sizeof(sta.sta.ssid), sc.ssid);
-        copy_field((char *)sta.sta.password, sizeof(sta.sta.password),
+        ff_copy_field((char *)sta.sta.ssid, sizeof(sta.sta.ssid), sc.ssid);
+        ff_copy_field((char *)sta.sta.password, sizeof(sta.sta.password),
                    sc.pass);
         sta.sta.threshold.authmode =
             sc.pass[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
@@ -224,6 +216,10 @@ static void wifi_init(void)
 
 /* Apply task: the ONLY place that runs a local window. In the v15
  * whole-card design a window is:
+ *  0. (v39) Wait for USB idle: no MSC write for FF_IDLE_WRITE_MS and
+ *     no read for FF_IDLE_READ_MS — reads alone stop blocking after
+ *     FF_SWAP_MAX_WAIT_MS. Skipped when the card is not with USB
+ *     (ejected) or the user forced it (/api/force).
  *  1. Pull the card from USB and mount it locally (the storage
  *     component signals media removal; FlashFloppy sees the stick
  *     leave, exactly like Kris's physical bench test).
@@ -237,14 +233,79 @@ static void wifi_init(void)
  *     image-on-startup = last, mounts the named image. Eject skips
  *     the hand-back: the card stays locally mounted and absent —
  *     which since v37 is also the upload state, in which uploads
- *     stream straight to the card with no staging step here. */
+ *     stream straight to the card with no staging step here.
+ * Failures land in g_ff.last_error, which the UI shows (v39). */
+static TaskHandle_t s_apply_task;
+
+void ff_apply_kick(void)
+{
+    if (s_apply_task) xTaskNotifyGive(s_apply_task);
+}
+
+/* True when the queued request may start now. */
+static bool usb_quiet_enough(void)
+{
+    ff_state_lock();
+    bool force = g_ff.force_swap;
+    bool with_usb = g_ff.presented;
+    uint32_t since = g_ff.pending_since_ms;
+    ff_state_unlock();
+    if (force || !with_usb) return true;
+    uint32_t now = ff_now_ms();
+    bool writes_quiet = now - g_ff.last_msc_write_ms >= FF_IDLE_WRITE_MS;
+    bool reads_quiet = now - g_ff.last_msc_read_ms >= FF_IDLE_READ_MS;
+    bool waited = now - since >= FF_SWAP_MAX_WAIT_MS;
+    /* Writes are never interrupted unless forced: a cut-off write
+     * is how an image gets corrupted. A steady trickle of reads
+     * (FlashFloppy/host polling) only delays the swap up to
+     * FF_SWAP_MAX_WAIT_MS — reads are safe to interrupt. */
+    return writes_quiet && (reads_quiet || waited);
+}
+
+static void set_idle(void)
+{
+    ff_state_lock();
+    g_ff.state = FF_STATE_IDLE;
+    g_ff.gen++;
+    ff_state_unlock();
+}
+
 static void apply_task(void *arg)
 {
     (void)arg;
+    bool waiting = false;
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(100));
+        /* Woken by ff_apply_kick(); while holding a request back
+         * for USB activity, re-check every 100 ms. */
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(waiting ? 100 : 1000));
+
         ff_state_lock();
-        if (g_ff.state != FF_STATE_SWAP_PENDING) {
+        bool repaint = g_ff.lcd_dirty;
+        bool pending_req = g_ff.state == FF_STATE_SWAP_PENDING;
+        ff_state_unlock();
+        if (repaint) {
+            ff_lcd_show_status(g_ff.presented ? "Presented" : "Ejected",
+                               NULL);
+        }
+        if (!pending_req) {
+            waiting = false;
+            continue;
+        }
+        if (!usb_quiet_enough()) {
+            if (!waiting) {
+                ESP_LOGI(TAG, "request queued: waiting for the USB "
+                              "host to go idle");
+            }
+            waiting = true;
+            ff_state_lock();
+            g_ff.waiting_usb = true;
+            ff_state_unlock();
+            continue;
+        }
+        waiting = false;
+
+        ff_state_lock();
+        if (g_ff.state != FF_STATE_SWAP_PENDING) { /* raced away */
             ff_state_unlock();
             continue;
         }
@@ -252,18 +313,21 @@ static void apply_task(void *arg)
         snprintf(pending, sizeof(pending), "%s", g_ff.pending_path);
         bool eject = g_ff.eject_requested;
         bool restart = g_ff.restart_after_swap;
+        bool forced = g_ff.force_swap;
         g_ff.pending_path[0] = 0;
         g_ff.eject_requested = false;
         g_ff.restart_after_swap = false;
         g_ff.force_swap = false;
+        g_ff.waiting_usb = false;
         g_ff.state = FF_STATE_DISCONNECTED;
+        g_ff.gen++; /* invalidates any peek in flight */
         ff_state_unlock();
+        if (forced) ESP_LOGW(TAG, "USB idle wait skipped (forced)");
 
         if (ff_sdcard_local_begin() != ESP_OK) {
-            ESP_LOGE(TAG, "local window failed; request dropped");
-            ff_state_lock();
-            g_ff.state = FF_STATE_IDLE;
-            ff_state_unlock();
+            set_idle();
+            ff_state_set_error("Could not take the card from USB "
+                               "(local mount failed); nothing changed");
             continue;
         }
         ff_state_lock();
@@ -279,25 +343,41 @@ static void apply_task(void *arg)
 
         ff_store_refresh();
         if (!eject && pending[0]) {
-            ff_store_write_image_a(pending);
+            if (ff_store_write_image_a(pending) != ESP_OK) {
+                ff_state_set_error("Writing IMAGE_A.CFG for %.100s "
+                                   "failed; the previous image stays "
+                                   "selected", pending);
+                restart = false; /* don't reboot into the old image */
+            }
             ff_store_refresh();
         }
 
         if (eject) {
-            ff_state_lock();
-            g_ff.state = FF_STATE_IDLE;
-            ff_state_unlock();
+            set_idle();
             ESP_LOGI(TAG, "ejected: card stays unmounted until the "
                           "next select");
+            ff_lcd_show_status("Ejected", NULL);
             continue;
         }
-        if (ff_sdcard_local_end() == ESP_OK) {
+        /* Hand back, with a couple of retries (v39): a failure here
+         * used to leave the card invisible to the Gotek with nothing
+         * in the UI. */
+        esp_err_t end_err = ESP_FAIL;
+        for (int attempt = 0; attempt < 3 && end_err != ESP_OK;
+             attempt++) {
+            if (attempt) vTaskDelay(pdMS_TO_TICKS(500));
+            end_err = ff_sdcard_local_end();
+        }
+        if (end_err == ESP_OK) {
+            char cur[256];
             ff_state_lock();
             g_ff.state = FF_STATE_PRESENTED;
+            g_ff.gen++;
+            snprintf(cur, sizeof(cur), "%s", g_ff.current_path);
             ff_state_unlock();
             ESP_LOGI(TAG, "card re-inserted; FlashFloppy should mount "
-                          "%s", g_ff.current_path);
-            ff_lcd_show_status("Presented", g_ff.current_path);
+                          "%s", cur);
+            ff_lcd_show_status("Presented", cur);
             if (restart) {
                 /* The point of the power feature: swap the image,
                  * then bounce the host so it boots the new one. */
@@ -305,9 +385,11 @@ static void apply_task(void *arg)
                 ff_power_restart_async();
             }
         } else {
-            ff_state_lock();
-            g_ff.state = FF_STATE_IDLE;
-            ff_state_unlock();
+            set_idle(); /* card still local: same as ejected */
+            ff_state_set_error("Could not hand the card back to the "
+                               "Gotek; the drive is ejected - press "
+                               "Re-insert to try again");
+            ff_lcd_show_status("Ejected", NULL);
         }
     }
 }
@@ -319,7 +401,10 @@ static void apply_task(void *arg)
  * current image, the NVS last-used record, and the LCD. A changed
  * sample is only believed after a second identical read 200 ms
  * later (the button-side rewrite caught mid-update can tear).
- * Read-only throughout: this task can never write the card. */
+ * v39: the result is also dropped if a local window started or
+ * ended while the reads were in flight (g_ff.gen changed) — before,
+ * a stale sample could overwrite a selection the apply task had just
+ * written. Read-only throughout: this task can never write the card. */
 static void peek_task(void *arg)
 {
     (void)arg;
@@ -330,6 +415,7 @@ static void peek_task(void *arg)
         bool ours = g_ff.presented &&
                     (g_ff.state == FF_STATE_PRESENTED ||
                      g_ff.state == FF_STATE_IDLE);
+        uint32_t gen = g_ff.gen;
         ff_state_unlock();
         if (!ours) continue;
         if (ff_store_peek_image_a(name, sizeof(name)) != ESP_OK) {
@@ -346,15 +432,16 @@ static void peek_task(void *arg)
             continue;
         }
         ff_state_lock();
-        snprintf(g_ff.current_path, sizeof(g_ff.current_path), "%s",
-                 name);
-        ff_state_unlock();
-        nvs_handle_t nv;
-        if (nvs_open("ff", NVS_READWRITE, &nv) == ESP_OK) {
-            nvs_set_str(nv, "last", name);
-            nvs_commit(nv);
-            nvs_close(nv);
+        bool still_valid = g_ff.gen == gen && g_ff.presented &&
+                           (g_ff.state == FF_STATE_PRESENTED ||
+                            g_ff.state == FF_STATE_IDLE);
+        if (still_valid) {
+            snprintf(g_ff.current_path, sizeof(g_ff.current_path),
+                     "%s", name);
         }
+        ff_state_unlock();
+        if (!still_valid) continue;
+        if (name[0]) ff_nvs_save_last(name);
         ESP_LOGI(TAG, "IMAGE_A.CFG changed on the card: now names "
                       "%s (Gotek-side selection?)",
                  name[0] ? name : "(none)");
@@ -386,27 +473,22 @@ void app_main(void)
              * Without a record, IMAGE_A.CFG stays whatever
              * FlashFloppy itself last wrote, which is the same
              * thing from its point of view. */
-            nvs_handle_t nv;
-            if (nvs_open("ff", NVS_READONLY, &nv) == ESP_OK) {
-                char last[256] = {0};
-                size_t len = sizeof(last);
-                if (nvs_get_str(nv, "last", last, &len) == ESP_OK &&
-                    last[0]) {
-                    char path[420];
-                    snprintf(path, sizeof(path), "%s/%s",
-                             FF_SD_MOUNT_POINT, last);
-                    struct stat st;
-                    if (stat(path, &st) == 0) {
-                        ff_store_write_image_a(last);
-                        ESP_LOGI(TAG, "auto-present: IMAGE_A.CFG "
-                                      "names %s", last);
-                    } else {
-                        ESP_LOGW(TAG, "last used file %s is gone; "
-                                      "leaving IMAGE_A.CFG as-is",
-                                 last);
-                    }
+            char last[256] = {0};
+            if (ff_nvs_load_last(last, sizeof(last)) == ESP_OK &&
+                last[0]) {
+                char path[420];
+                snprintf(path, sizeof(path), "%s/%s",
+                         FF_SD_MOUNT_POINT, last);
+                struct stat st;
+                if (stat(path, &st) == 0) {
+                    ff_store_write_image_a(last);
+                    ESP_LOGI(TAG, "auto-present: IMAGE_A.CFG "
+                                  "names %s", last);
+                } else {
+                    ESP_LOGW(TAG, "last used file %s is gone; "
+                                  "leaving IMAGE_A.CFG as-is",
+                             last);
                 }
-                nvs_close(nv);
             }
             ff_store_refresh();
         }
@@ -416,7 +498,7 @@ void app_main(void)
     ff_lcd_init();
     wifi_init();
     /* Repaint now that the SSID/IP footer has real values. */
-    ff_lcd_show_status("Presented", g_ff.current_path);
+    ff_lcd_show_status("Presented", NULL);
     ff_http_start();
     if (card_ok) {
         ff_sdcard_local_end(); /* hand the card to the Gotek */
@@ -424,13 +506,14 @@ void app_main(void)
     /* 8192: the apply task's call chain (storage refresh, stdio
      * over FatFs) needs the same headroom the swap task did —
      * 4096 overflowed twice in this project's history. */
-    xTaskCreate(apply_task, "ff_apply", 8192, NULL, 5, NULL);
+    xTaskCreate(apply_task, "ff_apply", 8192, NULL, 5, &s_apply_task);
     if (card_ok) {
         /* Watches for Gotek-side selections via the sector peek. */
         xTaskCreate(peek_task, "ff_peek", 4096, NULL, 4, NULL);
     }
     /* v36: keep the Kasa outlet's state + watts fresh in the
-     * background (no-op when POWER.CFG is absent). */
-    ff_power_start_polling();
+     * background; v39: plus the command worker (no-op when
+     * POWER.CFG is absent). */
+    ff_power_start();
     ESP_LOGI(TAG, "FlashFloppy ESP32 frontend up (whole-card design)");
 }
