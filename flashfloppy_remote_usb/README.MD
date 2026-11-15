@@ -5,7 +5,7 @@ This project now lives in its own repository:
 **https://github.com/Kris-Sekula/FlashFloppy-Remote**
 
 Everything that used to be in this folder — the ESP32 firmware, the web UI,
-the FTP server, `ffremote.py`, and the browser flasher — moved there with
+the FTP server, and `ffremote.py` — moved there with
 its full history. v44 was the last version published here; later work
 lives in the new repository.
 
