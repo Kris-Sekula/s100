@@ -30,6 +30,29 @@ uint32_t ff_now_ms(void)
     return (uint32_t)(esp_timer_get_time() / 1000);
 }
 
+bool ff_hostname_sanitize(const char *in, char *out, size_t cap)
+{
+    if (!in || !out || cap < 2) {
+        if (out && cap) out[0] = 0;
+        return false;
+    }
+    size_t n = 0;
+    for (const char *p = in; *p && n + 1 < cap; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c >= 'A' && c <= 'Z') c += 32;
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '-') {
+            out[n++] = (char)c;
+        }
+    }
+    out[n] = 0;
+    while (n && out[n - 1] == '-') out[--n] = 0;
+    size_t start = 0;
+    while (out[start] == '-') start++;
+    if (start) memmove(out, out + start, n - start + 1);
+    return out[0] != 0;
+}
+
 void ff_nvs_save_last(const char *name)
 {
     nvs_handle_t nv;

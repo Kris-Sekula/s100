@@ -38,6 +38,7 @@ static const char *TAG = "ff_lcd";
 #define COL_NAME 0xffff   /* white */
 #define COL_DIM 0x9d13    /* grey-blue */
 #define COL_NET 0x07ff    /* cyan */
+#define COL_FTP_ACT 0x07e0 /* green: FTP transfer in progress */
 
 static esp_lcd_panel_handle_t s_panel;
 static uint16_t *s_fb; /* PSRAM framebuffer, RGB565 byte-swapped */
@@ -111,11 +112,15 @@ static void render(const char *title, const char *name)
     if (!s_panel || !s_fb || !s_lcd_lock) return;
     /* Copy the shared strings under the state lock first; callers
      * never hold it when they ask for a repaint. */
-    char cur[256], ssid[33], ip[16];
+    char cur[256], ssid[33], ip[16], host[64];
+    bool ftp_on, ftp_busy;
     ff_state_lock();
     snprintf(cur, sizeof(cur), "%s", g_ff.current_path);
     snprintf(ssid, sizeof(ssid), "%s", g_ff.wifi_ssid);
     snprintf(ip, sizeof(ip), "%s", g_ff.wifi_ip);
+    snprintf(host, sizeof(host), "%s", g_ff.hostname);
+    ftp_on = g_ff.ftp_connected;
+    ftp_busy = g_ff.upload_active || g_ff.download_active;
     g_ff.lcd_dirty = false;
     ff_state_unlock();
 
@@ -124,6 +129,16 @@ static void render(const char *title, const char *name)
     xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(200));
     fb_fill(COL_BG);
     fb_text(6, 6, "FLASHFLOPPY", 1, COL_HDR, LCD_W - 12);
+    /* FTP badge (v44, as in the generic project's v17): a small
+     * chip in the header's top-right corner while a control
+     * session is connected — cyan when idle, green while a
+     * transfer streams. The letters are knocked out (drawn in
+     * the background colour over the filled chip). */
+    if (ftp_on) {
+        fb_rect(LCD_W - 42, 5, 36, 20,
+                ftp_busy ? COL_FTP_ACT : COL_NET);
+        fb_text(LCD_W - 39, 6, "FTP", 1, COL_BG, 36);
+    }
     fb_rect(6, 30, LCD_W - 12, 1, COL_DIM);
     fb_text(6, 40, title && title[0] ? title : "Presented", 1,
             COL_DIM, LCD_W - 12);
@@ -132,14 +147,26 @@ static void render(const char *title, const char *name)
     fb_rect(6, 246, LCD_W - 12, 1, COL_DIM);
     int y = 258;
     if (ssid[0]) {
+        /* v44: the "SSID: " prefix is gone — a bare SSID up to
+         * 16 chars fits on one line, which leaves room for the
+         * hostname line below; with the prefix, a typical SSID
+         * wrapped and the footer ran off the bottom edge. */
+        y = fb_text(6, y, ssid, 1, COL_NET, LCD_W - 12);
         char line[48];
-        snprintf(line, sizeof(line), "SSID: %s", ssid);
-        y = fb_text(6, y, line, 1, COL_NET, LCD_W - 12);
         snprintf(line, sizeof(line), "IP: %s",
                  ip[0] ? ip : "joining...");
-        fb_text(6, y + 6, line, 1, COL_NET, LCD_W - 12);
+        y = fb_text(6, y + 2, line, 1, COL_NET, LCD_W - 12);
     } else {
-        fb_text(6, y, "WiFi: starting", 1, COL_NET, LCD_W - 12);
+        y = fb_text(6, y, "WiFi: starting", 1, COL_NET, LCD_W - 12);
+    }
+    /* v44: the mDNS name, so the web/FTP address is on the
+     * screen. Only drawn when it fits — a long SSID that wraps
+     * can push the footer past the bottom edge. */
+    if (y + 2 + 18 <= LCD_H) {
+        char line[80];
+        snprintf(line, sizeof(line), "%s.local",
+                 host[0] ? host : FF_HOSTNAME_DEFAULT);
+        fb_text(6, y + 2, line, 1, COL_NET, LCD_W - 12);
     }
     if (esp_lcd_panel_draw_bitmap(s_panel, 0, 0, LCD_W, LCD_H, s_fb) !=
         ESP_OK) {

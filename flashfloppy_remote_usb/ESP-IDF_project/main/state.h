@@ -21,6 +21,9 @@ typedef enum {
     FF_STATE_PRESENTED,   /* card handed back to USB, awaiting Gotek mount */
 } ff_state_t;
 
+/* Default mDNS hostname (v44); WIFI.CFG hostname= overrides it. */
+#define FF_HOSTNAME_DEFAULT "flashfloppy"
+
 typedef struct {
     ff_state_t state;
     SemaphoreHandle_t sd_mutex; /* guards this struct and staged state */
@@ -35,6 +38,10 @@ typedef struct {
     bool upload_active;         /* a direct-to-card upload is
                                    streaming (v37); windows are
                                    refused until it finishes */
+    bool download_active;       /* an FTP download (RETR) is
+                                   streaming (v43); same refusal */
+    bool ftp_connected;         /* an FTP control session is
+                                   open (v43); shown in /api/status */
     char current_path[256];     /* image named by IMAGE_A.CFG — since
                                    v18 a bare root filename ("disk.hfe"),
                                    "" if none */
@@ -43,6 +50,9 @@ typedef struct {
                                    for /api/status; set by the Wi-Fi init */
     char wifi_ssid[33];         /* SSID in use, for the LCD footer */
     char wifi_ip[16];           /* our IP in use, for the LCD footer */
+    char hostname[64];          /* mDNS hostname, no ".local" suffix
+                                   (v44); FF_HOSTNAME_DEFAULT unless
+                                   WIFI.CFG hostname= says otherwise */
     uint32_t pending_since_ms;  /* when the current request was queued */
     uint32_t gen;               /* bumped at every local window (v39):
                                    the peek task drops a result whose

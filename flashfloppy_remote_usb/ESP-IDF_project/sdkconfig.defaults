@@ -31,3 +31,12 @@ CONFIG_ESP_CONSOLE_UART_CUSTOM_RX_GPIO=2
 # there is no sdkconfig yet — or set both in idf.py menuconfig.)
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+# Socket budget (v43): ESP-IDF's default CONFIG_LWIP_MAX_SOCKETS
+# is 10, and the FTP server (control listener + PASV listener +
+# data socket) plus the httpd's sessions exhaust it — the generic
+# project's v07/v08 bench failed exactly there (httpd accept
+# errno 23 ENFILE, PASV failures). 16 leaves headroom for both
+# servers plus the Kasa poller. Only applies when there is no
+# sdkconfig yet — or set it in idf.py menuconfig.
+CONFIG_LWIP_MAX_SOCKETS=16

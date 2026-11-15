@@ -13,6 +13,8 @@ void ff_state_init(void)
     memset(&g_ff, 0, sizeof(g_ff));
     g_ff.sd_mutex = xSemaphoreCreateMutex();
     g_ff.state = FF_STATE_IDLE;
+    snprintf(g_ff.hostname, sizeof(g_ff.hostname), "%s",
+             FF_HOSTNAME_DEFAULT);
     /* "Long ago", so the USB idle check passes until real traffic
      * is seen. */
     g_ff.last_msc_write_ms = ff_now_ms() - 600000u;

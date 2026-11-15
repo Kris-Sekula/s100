@@ -1,2 +1,5 @@
 dependencies:
   espressif/esp_tinyusb: ">=1.7.0,<2.0.0"
+  # mDNS (v43): the gadget answers to flashfloppy.local. Since
+  # IDF 5.3 the component lives on the registry, not in-tree.
+  espressif/mdns: ">=1.0.0,<2.0.0"

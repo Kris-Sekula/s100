@@ -199,7 +199,9 @@ esp_err_t ff_store_refresh(void)
     /* Everything lives in the root (v18). IMAGE_A.CFG is FlashFloppy's
      * own state and WIFI.CFG is ours; neither is listed. Directories
      * and dotfiles (a card reader's housekeeping included) are
-     * skipped by the regular-file and name checks. */
+     * skipped by the regular-file and name checks. FTP.CFG (v43)
+     * is skipped the same way as WIFI.CFG: it holds a password,
+     * and listing it as a selectable image would be worse. */
     int count = 0;
     DIR *d = opendir(FF_SD_MOUNT_POINT);
     if (d) {
@@ -207,7 +209,8 @@ esp_err_t ff_store_refresh(void)
         while ((e = readdir(d)) != NULL && count < FF_STORE_MAX_ENTRIES) {
             if (e->d_name[0] == '.') continue;
             if (strcasecmp(e->d_name, "IMAGE_A.CFG") == 0 ||
-                strcasecmp(e->d_name, "WIFI.CFG") == 0) continue;
+                strcasecmp(e->d_name, "WIFI.CFG") == 0 ||
+                strcasecmp(e->d_name, "FTP.CFG") == 0) continue;
             if (ff_store_is_temp_name(e->d_name)) continue;
             char path[420];
             snprintf(path, sizeof(path), "%s/%s", FF_SD_MOUNT_POINT,
@@ -217,6 +220,7 @@ esp_err_t ff_store_refresh(void)
             ff_entry_t *en = &s_scan[count++];
             ff_copy_field(en->name, sizeof(en->name), e->d_name);
             en->size = (uint32_t)st.st_size;
+            en->mtime = (uint32_t)st.st_mtime;
             en->kind = is_config_name(e->d_name) ? FF_KIND_CONFIG
                        : is_backup_name(e->d_name) ? FF_KIND_BACKUP
                                                    : FF_KIND_IMAGE;
@@ -348,6 +352,50 @@ esp_err_t ff_store_write_image_a(const char *rel)
 }
 
 /* ---- direct streaming upload (v37) ---- */
+
+/* v43: moved here from http_server.c (v39 static) so the FTP
+ * server applies the identical rule to STOR/RNTO targets. */
+const char *ff_store_name_problem(const char *name)
+{
+    size_t n = strlen(name);
+    if (n == 0) return "empty file name";
+    if (n > 120) return "file name too long (120 characters max)";
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        if (*p < 0x20 || *p == 0x7f || strchr("<>:\"|?*", *p)) {
+            return "file name contains a character FAT cannot store "
+                   "(< > : \" | ? * or a control character)";
+        }
+    }
+    if (name[n - 1] == '.' || name[n - 1] == ' ') {
+        return "file name cannot end with a dot or space";
+    }
+    if (ff_store_is_temp_name(name)) {
+        return "names ending in .part or .prev are reserved";
+    }
+    return NULL;
+}
+
+esp_err_t ff_store_rename(const char *from, const char *to,
+                          char *err, size_t errcap)
+{
+    char src[420], dst[420];
+    snprintf(src, sizeof(src), "%s/%s", FF_SD_MOUNT_POINT, from);
+    snprintf(dst, sizeof(dst), "%s/%s", FF_SD_MOUNT_POINT, to);
+    if (!file_exists(src)) {
+        snprintf(err, errcap, "No such file");
+        return ESP_FAIL;
+    }
+    if (file_exists(dst)) {
+        snprintf(err, errcap, "A file with that name already exists");
+        return ESP_FAIL;
+    }
+    if (rename(src, dst) != 0) {
+        snprintf(err, errcap, "rename failed");
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "renamed %s to %s", from, to);
+    return ESP_OK;
+}
 
 esp_err_t ff_store_write_stream(const char *name, ff_fill_fn fill,
                                 void *ctx, size_t *written_out)

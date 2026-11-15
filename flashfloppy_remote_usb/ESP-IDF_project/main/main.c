@@ -4,9 +4,11 @@
 #include "storage.h"
 #include "power.h"
 #include "http_server.h"
+#include "ftp_server.h"
 #include "lcd.h"
 #include "button.h"
 #include "util.h"
+#include "mdns.h" /* flashfloppy.local (v43) */
 #include <stdio.h>  /* snprintf() */
 #include <stdlib.h> /* atoi() for the POWER.CFG parser */
 #include <string.h>
@@ -29,11 +31,14 @@ static const char *TAG = "ff_main";
  * holds ssid=... / password=... / mode=auto|sta|ap, station mode is
  * attempted first: mode auto falls back to the AP when the join does
  * not complete within FF_WIFI_JOIN_TIMEOUT_MS, mode sta keeps
- * retrying in the background. */
+ * retrying in the background. hostname= (v44) renames the gadget
+ * for mDNS (<hostname>.local); it applies in station and AP mode
+ * alike, and is sanitised to lowercase letters, digits and hyphens. */
 typedef struct {
     char ssid[32]; /* Wi-Fi SSIDs are at most 32 bytes */
     char pass[64]; /* WPA passphrases are at most 63 chars */
     char mode[8];  /* "auto" (default), "sta", "ap" */
+    char hostname[64]; /* sanitised mDNS name, "" = default (v44) */
 } sta_cfg_t;
 
 static EventGroupHandle_t s_wifi_evt;
@@ -107,6 +112,11 @@ static bool read_sta_cfg(sta_cfg_t *cfg)
             ff_copy_field(cfg->pass, sizeof(cfg->pass), val);
         } else if (strcasecmp(key, "mode") == 0) {
             ff_copy_field(cfg->mode, sizeof(cfg->mode), val);
+        } else if (strcasecmp(key, "hostname") == 0) {
+            /* v44: an unsanitiseable value leaves the field empty,
+             * which wifi_init reads as "use the default". */
+            ff_hostname_sanitize(val, cfg->hostname,
+                                 sizeof(cfg->hostname));
         }
     }
     fclose(f);
@@ -180,7 +190,15 @@ static void wifi_init(void)
         IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL));
 
     sta_cfg_t sc;
-    if (read_sta_cfg(&sc)) {
+    bool sta_ok = read_sta_cfg(&sc);
+    /* v44: the mDNS name comes from WIFI.CFG (hostname=) or the
+     * default, and applies in station and AP mode alike — so it is
+     * set here, before the mode branch, not inside it. */
+    ff_state_lock();
+    snprintf(g_ff.hostname, sizeof(g_ff.hostname), "%s",
+             sc.hostname[0] ? sc.hostname : FF_HOSTNAME_DEFAULT);
+    ff_state_unlock();
+    if (sta_ok) {
         esp_netif_create_default_wifi_sta();
         wifi_config_t sta = {0};
         ff_copy_field((char *)sta.sta.ssid, sizeof(sta.sta.ssid), sc.ssid);
@@ -450,6 +468,33 @@ static void peek_task(void *arg)
     }
 }
 
+/* mDNS (v43): the gadget answers to <hostname>.local on the LAN,
+ * in station and AP mode alike — no more hunting the DHCP address.
+ * The hostname comes from WIFI.CFG (hostname=, v44) or defaults to
+ * "flashfloppy". The component tracks the interfaces itself, so
+ * this runs once, right after Wi-Fi init, whatever mode or join
+ * state that ended in. The _http and _ftp service advertisements
+ * are a bonus (network browsers and some FTP clients discover
+ * them); the hostname resolution is what makes
+ * http://flashfloppy.local/ and ftp://flashfloppy.local work.
+ * Two gadgets on one network resolve to flashfloppy.local and
+ * flashfloppy-2.local (standard mDNS conflict handling).
+ * Failure is not fatal: the IP address keeps working, so errors
+ * are logged, never ESP_ERROR_CHECK'd. */
+static void mdns_start(void)
+{
+    if (mdns_init() != ESP_OK) {
+        ESP_LOGW(TAG, "mDNS init failed; use the IP address");
+        return;
+    }
+    mdns_hostname_set(g_ff.hostname);
+    mdns_instance_name_set("FlashFloppy");
+    mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+    mdns_service_add(NULL, "_ftp", "_tcp", FF_FTP_PORT, NULL, 0);
+    ESP_LOGI(TAG, "mDNS up: http://%s.local/ "
+                  "(FTP on port %d)", g_ff.hostname, FF_FTP_PORT);
+}
+
 void app_main(void)
 {
     ff_state_init();
@@ -498,10 +543,14 @@ void app_main(void)
     }
     ff_lcd_init();
     wifi_init();
+    mdns_start();
     /* Repaint now that the SSID/IP footer has real values. */
     ff_lcd_show_status("Presented", NULL);
     ff_http_start();
     if (card_ok) {
+        /* FTP.CFG is read inside, so the FTP server starts while
+         * the card is still locally mounted. */
+        ff_ftp_start();
         ff_sdcard_local_end(); /* hand the card to the Gotek */
     }
     /* 8192: the apply task's call chain (storage refresh, stdio

@@ -11,8 +11,10 @@ Simply insert into your Gotek drive and control remotly
 
 ![In action](https://github.com/Kris-Sekula/s100/blob/main/flashfloppy_remote_usb/remote_usb.jpg)
 
-The board's own LCD shows the selected file name, the Wi-Fi network, and the
-IP address.
+The board's own LCD shows the selected file name, the Wi-Fi network, the
+IP address and the mDNS hostname (`<hostname>.local`), plus a small `FTP`
+badge in the header while an FTP client is connected (cyan idle, green
+while a transfer streams).
 
 ## Features
 
@@ -29,8 +31,10 @@ IP address.
   straight to the card over Wi-Fi, any size the card can hold; an upload
   never fights the Gotek for the filesystem because the Gotek doesn't
   have it at the time.
-- **LCD status display** — selected file name in large type, plus SSID and IP
-  address, on the board's 1.47" colour LCD.
+- **LCD status display** — selected file name in large type, plus SSID, IP
+  address and the mDNS hostname (`<hostname>.local`), on the board's 1.47"
+  colour LCD. An `FTP` badge appears in the header while an FTP client is
+  connected — cyan when idle, green while a transfer streams.
 - **BOOT-button browsing** — tap the board's BOOT button to preview
   the next image on the LCD, FlashFloppy-style; stop pressing for
   2 seconds and the previewed image is swapped in. The LCD blanks
@@ -42,6 +46,14 @@ IP address.
   from the same UI via a TP-Link Kasa strip/plug (e.g. HS300), including a
   one-click restart, an automatic restart right after an image swap, and a
   live power-draw readout.
+- **Find it as `flashfloppy.local`** — the gadget answers to that name on
+  the LAN (station and AP mode alike), so no more hunting the DHCP address.
+  Two gadgets on one network become `flashfloppy.local` and
+  `flashfloppy-2.local`. The name can be changed with `hostname=` in
+  `WIFI.CFG` (see below).
+- **Plain FTP** — upload, download, delete and rename from any FTP client
+  (FileZilla, WinSCP), same eject-first rule as the web upload. See
+  *Using FTP* below.
 
 ## Hardware
 
@@ -111,7 +123,15 @@ To join your home network instead, create a file named **`WIFI.CFG`** in the
 ssid=YourNetworkName
 password=YourPassword
 mode=auto
+hostname=flashfloppy
 ```
+
+`hostname=` is optional and defaults to `flashfloppy`. It is the mDNS
+name the gadget answers to (`<hostname>.local` for the web UI and FTP),
+and it is shown in the LCD footer. Only lowercase letters, digits and
+hyphens are kept — anything else (spaces, dots, underscores, capitals)
+is dropped, and an empty result falls back to `flashfloppy`. It applies
+in station and AP mode alike, so it works even with no `ssid=` line.
 
 | Key | Values | Meaning |
 |---|---|---|
@@ -125,8 +145,9 @@ Keeping the credentials in `WIFI.CFG` on the card (rather than compiled in)
 means firmware updates never wipe them.
 
 Once joined, the device takes a DHCP address from your router. The address
-is shown on the LCD and printed in the serial log; the web UI is then at
-`http://<that-address>/`.
+and the `<hostname>.local` name are shown on the LCD and printed in the
+serial log; the web UI is then at `http://<that-address>/` or
+`http://<hostname>.local/`.
 
 ## Controlling machine power (optional)
 
@@ -236,6 +257,32 @@ a failed command shows in red under the power state.
 **LCD** — shows the presented file name, SSID, and IP address, updated on
 every change, including selections made on the Gotek itself.
 
+## Using FTP (v43)
+
+Point any FTP client at `flashfloppy.local` (or the `hostname=` from
+`WIFI.CFG`, if set — or the IP address), port 21.
+Passive mode only — active mode is refused, so Windows' built-in `ftp.exe`
+won't work; FileZilla, WinSCP and every modern client default to passive.
+
+- **Login** — user `usb`, password `remoteusb`, unless `/sdcard/FTP.CFG`
+  sets something else (`user=` / `pass=` lines; an empty `pass=` disables
+  the password check). The file is read once at boot.
+- **Eject first** — exactly like the web upload, file changes (upload,
+  delete, rename) need the drive ejected; the server answers 550 while
+  the drive is presented. Browsing (`LIST`/`NLST`/`SIZE`/`MDTM`) works in
+  any state, from the same snapshot the web UI shows.
+- **Root only** — this gadget has no folder concept: `MKD`/`RMD` are
+  refused and nested paths get a 550. `IMAGE_A.CFG`, `INIT_A.CFG` and
+  `FTP.CFG` are protected from FTP changes (same refusals as the web
+  upload for the first two; the FTP server reads `FTP.CFG` once at boot,
+  so a live overwrite would silently not take effect). `WIFI.CFG` and
+  `POWER.CFG` can be replaced over FTP, like the web upload — reboot to
+  apply.
+- Uploads stream straight to the card (`.part` + rename on clean finish,
+  old copy kept as `.prev` until the new one is in place), the same
+  mechanism as the web upload. While an FTP transfer streams, the web UI
+  refuses selects/ejects/uploads, and the status line says so.
+
 ## Using the BOOT button
 
 The board's BOOT button works the way FlashFloppy's own button
@@ -300,8 +347,9 @@ the card is the single source of truth, whichever side changed it last.
 
 ## Notes and limitations
 
-- **No authentication on the web UI.** Run it on a trusted LAN only;
-  don't port-forward it.
+- **No authentication on the web UI, and FTP is plain text.** Run it on a
+  trusted LAN only; don't port-forward it. Change the FTP password in
+  `FTP.CFG` if the defaults bother you.
 - Uploads require the drive to be **ejected** (they write directly
   to the card while it is detached; see *Uploading* above). File
   size is limited only by free card space and FAT32's 4 GiB
@@ -320,6 +368,8 @@ main/
   storage.c      card snapshot, IMAGE_A.CFG read/write, direct
                  streaming upload, raw-sector peek
   http_server.c  REST API (/api/status, /api/library, /api/select, ...)
+  ftp_server.c   plain FTP server, port 21, passive-only (v43)
+  paths.c/h      path normalisation / confinement for FTP (v43)
   web_ui.h       the embedded web page
   lcd.c          ST7789 status display
   power.c        TP-Link Kasa outlet control (POWER.CFG)

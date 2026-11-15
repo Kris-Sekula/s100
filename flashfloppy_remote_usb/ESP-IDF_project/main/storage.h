@@ -16,6 +16,8 @@ typedef enum { FF_KIND_IMAGE = 0, FF_KIND_CONFIG, FF_KIND_BACKUP } ff_kind_t;
 typedef struct {
     char name[160]; /* basename; everything lives in the card root */
     uint32_t size;
+    uint32_t mtime; /* FAT timestamp, seconds since epoch (v43:
+                       FTP LIST dates + MDTM read it from here) */
     ff_kind_t kind;
 } ff_entry_t;
 
@@ -44,6 +46,20 @@ bool ff_store_is_temp_name(const char *name);
 /* Write IMAGE_A.CFG naming rel — since v18 simply the image's
  * filename in the root (e.g. "disk.hfe"). Local window only. */
 esp_err_t ff_store_write_image_a(const char *rel);
+
+/* v43: names FAT cannot store, and our own upload temporaries,
+ * refused up front instead of failing at fopen() time. Was a
+ * static in http_server.c (v39); moved here so the FTP server
+ * applies the same rule to STOR/RNTO. Returns NULL when the name
+ * is fine, else a human-readable reason. */
+const char *ff_store_name_problem(const char *name);
+
+/* v43: rename a root file (FTP RNFR/RNTO). Refuses when the
+ * source is missing or the target already exists — rename never
+ * overwrites here. On failure writes a short reason into err.
+ * Local window / ejected state only; the caller refreshes. */
+esp_err_t ff_store_rename(const char *from, const char *to,
+                          char *err, size_t errcap);
 
 /* Direct streaming upload (v37, replacing PSRAM staging): the
  * body is written straight to the card as <name>.part and renamed

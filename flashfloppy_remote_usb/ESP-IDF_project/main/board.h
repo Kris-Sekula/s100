@@ -94,6 +94,24 @@
  * in the background (v36, Kris's ask: catch flips made elsewhere). */
 #define FF_POWER_POLL_MS 5000
 
+/* FTP server (v43, ported from the generic remote-USB project
+ * v07–v14): the web UI keeps its own upload, and plain FTP is the
+ * second file channel — FileZilla / WinSCP, any modern client.
+ * Control port 21, passive data connections only (a fixed port —
+ * active mode is refused), one session at a time, in its own
+ * FreeRTOS task (ftp_server.c). Credentials come from
+ * /sdcard/FTP.CFG at boot (user=/pass= lines); the defaults below
+ * apply when the file is absent, and an explicitly empty pass=
+ * disables the password check. Like the web upload, mutations
+ * need the drive EJECTED; browsing (LIST/NLST/SIZE/MDTM) works in
+ * any state, from the snapshot. Root-only: this gadget has no
+ * folder concept, so MKD is refused and nested paths 550. */
+#define FF_FTP_CFG_PATH "/sdcard/FTP.CFG"
+#define FF_FTP_PORT 21
+#define FF_FTP_PASV_PORT 50000
+#define FF_FTP_USER_DEFAULT "usb"
+#define FF_FTP_PASS_DEFAULT "remoteusb"
+
 /* BOOT button behaviour (v42, FlashFloppy-style browsing): a press
  * previews the next image on the LCD; the preview commits through
  * the normal select path after FF_PREVIEW_COMMIT_MS with no

@@ -71,6 +71,9 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "presented", g_ff.presented);
     cJSON_AddBoolToObject(root, "ejected", ejected);
     cJSON_AddBoolToObject(root, "uploading", g_ff.upload_active);
+    cJSON_AddBoolToObject(root, "downloading", g_ff.download_active);
+    cJSON_AddBoolToObject(root, "ftp_connected", g_ff.ftp_connected);
+    cJSON_AddStringToObject(root, "hostname", g_ff.hostname);
     cJSON_AddBoolToObject(root, "waiting_usb",
                           g_ff.state == FF_STATE_SWAP_PENDING &&
                               g_ff.waiting_usb);
@@ -125,9 +128,9 @@ static esp_err_t request_window(httpd_req_t *req, const char *pending,
                                 bool eject, bool restart)
 {
     ff_state_lock();
-    if (g_ff.upload_active) {
+    if (g_ff.upload_active || g_ff.download_active) {
         ff_state_unlock();
-        return send_conflict(req, "upload in progress");
+        return send_conflict(req, "file transfer in progress");
     }
     if (g_ff.state == FF_STATE_SWAP_PENDING ||
         g_ff.state == FF_STATE_DISCONNECTED ||
@@ -159,7 +162,7 @@ static esp_err_t request_window(httpd_req_t *req, const char *pending,
 bool ff_request_select(const char *name)
 {
     ff_state_lock();
-    bool ok = !g_ff.upload_active &&
+    bool ok = !g_ff.upload_active && !g_ff.download_active &&
               g_ff.state != FF_STATE_SWAP_PENDING &&
               g_ff.state != FF_STATE_DISCONNECTED &&
               g_ff.state != FF_STATE_APPLYING;
@@ -301,28 +304,6 @@ static esp_err_t h_power_post(httpd_req_t *req)
     return send_json(req, "{\"ok\":true,\"queued\":true}");
 }
 
-/* v39: names FAT cannot store, and our own upload temporaries, are
- * refused up front instead of failing at fopen() time. */
-static const char *upload_name_problem(const char *name)
-{
-    size_t n = strlen(name);
-    if (n == 0) return "empty file name";
-    if (n > 120) return "file name too long (120 characters max)";
-    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
-        if (*p < 0x20 || *p == 0x7f || strchr("<>:\"|?*", *p)) {
-            return "file name contains a character FAT cannot store "
-                   "(< > : \" | ? * or a control character)";
-        }
-    }
-    if (name[n - 1] == '.' || name[n - 1] == ' ') {
-        return "file name cannot end with a dot or space";
-    }
-    if (ff_store_is_temp_name(name)) {
-        return "names ending in .part or .prev are reserved";
-    }
-    return NULL;
-}
-
 /* In-place percent-decoding for the upload ?name= value (query strings
  * arrive encoded; filenames like "My Disk.hfe" come in as My%20Disk).
  * Decoded UTF-8 bytes pass through untouched. Malformed % sequences
@@ -392,7 +373,7 @@ static esp_err_t h_upload(httpd_req_t *req)
     if (!name[0] || strstr(name, "..")) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad name");
     }
-    const char *problem = upload_name_problem(name);
+    const char *problem = ff_store_name_problem(name);
     if (problem) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, problem);
     }
@@ -418,7 +399,7 @@ static esp_err_t h_upload(httpd_req_t *req)
      * request_window() refuses to start a window while the claim
      * is held, so nothing else can touch the card mid-upload. */
     ff_state_lock();
-    bool busy = g_ff.upload_active ||
+    bool busy = g_ff.upload_active || g_ff.download_active ||
                 g_ff.state == FF_STATE_SWAP_PENDING ||
                 g_ff.state == FF_STATE_DISCONNECTED ||
                 g_ff.state == FF_STATE_APPLYING;

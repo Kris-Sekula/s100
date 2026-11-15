@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
@@ -15,6 +16,13 @@ void ff_copy_field(char *dst, size_t cap, const char *src);
 
 /* Strip leading spaces/tabs and trailing whitespace/CR/LF in place. */
 void ff_trim(char *s);
+
+/* Sanitise a WIFI.CFG hostname= value into an mDNS hostname (v44):
+ * lowercase letters, digits and hyphens only, at most cap-1 chars,
+ * no leading or trailing hyphen. `out` is always NUL-terminated;
+ * returns false when nothing usable is left (caller falls back to
+ * FF_HOSTNAME_DEFAULT). */
+bool ff_hostname_sanitize(const char *in, char *out, size_t cap);
 
 /* Milliseconds since boot, wrapping at 2^32 (~49 days). Compare
  * with unsigned subtraction: (now - then) >= interval. */
