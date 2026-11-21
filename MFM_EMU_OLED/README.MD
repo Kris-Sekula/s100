@@ -1,7 +1,7 @@
 # MFM emulator filename display — 128x64 SSD1306 OLED on J7 I2C2
 
 A standalone daemon that shows the filename of the file currently being
-emulated on a 0.96" I2C OLED. It does not modify `mfm_emu`, the PRU code,
+emulated on a 0.96" I2C OLED (or 1.3"). It does not modify `mfm_emu`, the PRU code,
 or any emulation file, so a missing or dead display cannot affect
 emulation.
 
@@ -11,9 +11,16 @@ Run it as display only:
 
 ... or with navigation buttons and HDD LED
 
-![DisplayPlus](https://github.com/Kris-Sekula/s100/blob/main/MFM_EMU_OLED/OLED_SW_LED.jpg)
+![DisplayPlus](https://github.com/Kris-Sekula/s100/blob/main/MFM_EMU_OLED/mfm_pcb_v1.1_m.jpg)
 
 Here is how to wire it ... buttons and LEDs are optional if you don't want to use them
+
+The PCB has two options: 
+* full size 20pin connector - use ribbon 20pin IDC on both ends ..
+* 1x8 pin and just run some dupon jumpers (this is what I do as pictured)
+
+![PCB_Back](https://github.com/Kris-Sekula/s100/blob/main/MFM_EMU_OLED/mfm_pcb_v1.1_back_m.jpg)
+
 
 ![Diagram](https://github.com/Kris-Sekula/s100/blob/main/MFM_EMU_OLED/Schematic_diagram.png)
 
