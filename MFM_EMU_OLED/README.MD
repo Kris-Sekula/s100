@@ -15,14 +15,14 @@ Run it as display only:
 
 Here is how to wire it ... buttons and LEDs are optional if you don't want to use them
 
+![Diagram](https://github.com/Kris-Sekula/s100/blob/main/MFM_EMU_OLED/Schematic_diagram.png)
+
 The PCB has two options: 
 * full size 20pin connector - use ribbon 20pin IDC on both ends ..
 * 1x8 pin and just run some dupon jumpers (this is what I do as pictured)
 
 ![PCB_Back](https://github.com/Kris-Sekula/s100/blob/main/MFM_EMU_OLED/mfm_pcb_v1.1_back_m.jpg)
 
-
-![Diagram](https://github.com/Kris-Sekula/s100/blob/main/MFM_EMU_OLED/Schematic_diagram.png)
 
 ## Dependencies: none beyond python3
 
