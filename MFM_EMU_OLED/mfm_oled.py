@@ -71,6 +71,19 @@ step the selection); a content change or a power loss also wakes
 it, so a POWER LOSS warning never sits on a dark screen.
 MFM_OLED_SCREENSAVER_SECONDS changes the timeout, 0 disables it.
 
+Display controller: most 0.96" 128x64 modules are SSD1306, most 1.3"
+128x64 modules are SH1106. They are the same resolution and share
+the I2C address and the commands this daemon uses, but the SH1106
+has 132 columns of display RAM and its glass shows columns 2..129,
+so an SSD1306 driver leaves two columns of unwritten garbage at
+the right edge (and shifts the image two pixels left). The daemon
+detects the controller automatically at startup (MFM_OLED_DRIVER,
+default "auto"): it tries one I2C read -- the SH1106 answers
+reads, the SSD1306's I2C interface is write-only and NAKs them
+(the same probe FlashFloppy has used since v2.4a). Set
+MFM_OLED_DRIVER=ssd1306 or =sh1106 to pin a controller and skip
+detection. See the controller notes beside OLED_DRIVER below.
+
 Usage:
   python3 mfm_oled.py                # daemon loop (what the service runs)
   python3 mfm_oled.py --once         # draw the current screen once, exit
@@ -94,6 +107,41 @@ import time
 # ---- Configuration: change these if your wiring/image differs ---------
 I2C_BUS = int(os.environ.get("MFM_OLED_BUS", "2"))       # /dev/i2c-2
 I2C_ADDR = int(os.environ.get("MFM_OLED_ADDR", "0x3c"), 0)
+
+# Display controller: "auto" (default), "ssd1306" or "sh1106", via
+# MFM_OLED_DRIVER. "auto" detects the controller at startup (see
+# SSD1306.detect below); an explicit value skips detection.
+# The two controllers look identical from the bus (same I2C address,
+# same page addressing, same command set for everything this daemon
+# uses) but their display RAM differs, and that is the whole story:
+#   SSD1306: 128 columns of RAM, the glass shows columns 0..127.
+#   SH1106:  132 columns of RAM, the glass shows columns 2..129.
+# An SSD1306 driver (column start 0) on an SH1106 therefore writes
+# its 128 bytes into RAM columns 0..127, the glass displays RAM
+# columns 2..129, and the rightmost two glass columns show RAM
+# columns 128..129 -- which the driver never wrote, so they hold
+# power-on garbage. The image also shifts two pixels left. The fix
+# is to start every page write at column 2 on an SH1106, so the 128
+# bytes land exactly on the visible columns 2..129.
+# The init sequence is deliberately shared: the SH1106 ignores the
+# 0x20 addressing-mode command (it is page-only by design) and the
+# common 1.3" modules accept the SSD1306 charge-pump bytes, so a
+# panel that already lights up needs no init change -- only the
+# column start moves.
+def controller_column_offset(driver):
+    name = str(driver).strip().lower()
+    if name == "ssd1306":
+        return 0
+    if name == "sh1106":
+        return 2
+    raise ValueError("unknown OLED controller %r (expected auto, ssd1306 "
+                     "or sh1106)" % driver)
+
+OLED_DRIVER = os.environ.get("MFM_OLED_DRIVER", "auto").strip().lower()
+if OLED_DRIVER not in ("auto", "ssd1306", "sh1106"):
+    print("mfm-oled: unknown OLED controller %r -- using auto"
+          % OLED_DRIVER, flush=True)
+    OLED_DRIVER = "auto"
 I2C_DEV = os.environ.get("MFM_OLED_I2C_DEV") or ("/dev/i2c-%d" % I2C_BUS)
 WIDTH = 128
 HEIGHT = 64
@@ -659,12 +707,51 @@ INIT_COMMANDS = [
 
 
 class SSD1306(object):
-    """Minimal SSD1306 driver on /dev/i2c-*, standard library only."""
+    """Minimal SSD1306 / SH1106 driver on /dev/i2c-*, standard library
+    only. The two controllers share one driver here; the only
+    difference is the per-instance column offset (see the
+    MFM_OLED_DRIVER notes at the top of the file)."""
 
-    def __init__(self, dev_path=I2C_DEV, addr=I2C_ADDR):
+    @staticmethod
+    def detect(fd):
+        """Tell an SSD1306 from an SH1106 by an I2C read probe.
+
+        Neither chip has an ID register, and both answer at the same
+        I2C address -- but their serial interfaces differ in one
+        observable way: the SH1106 can read its display RAM / status
+        back over I2C (datasheet-confirmed), while the SSD1306's I2C
+        interface is write-only and NAKs a read. So a read that is
+        answered means SH1106; a read the panel rejects (Linux i2c-dev
+        raises OSError, typically EREMOTEIO) means SSD1306. This is
+        the same probe FlashFloppy has used since v2.4a ("OLED:
+        Auto-detect SSD1306 vs SH1106") and Meshtastic's AutoOLEDWire
+        uses. The probe is harmless: it reads one byte, changes
+        nothing in RAM, and display() re-sets the page/column
+        address before every write, so the read advancing the
+        controller's column pointer has no visible effect. If the
+        panel is absent entirely the read also fails -- but then the
+        init writes below fail the same way they always did, and the
+        caller retries, so detection never masks a missing display.
+        """
+        try:
+            os.read(fd, 1)
+        except OSError:
+            return "ssd1306"
+        return "sh1106"
+
+    def __init__(self, dev_path=I2C_DEV, addr=I2C_ADDR, driver=None):
+        # driver: None takes the module default (OLED_DRIVER, "auto"
+        # unless MFM_OLED_DRIVER pins a controller); an explicit
+        # value skips detection entirely.
+        self.controller = (driver or OLED_DRIVER or "auto").strip().lower()
+        if self.controller not in ("auto", "ssd1306", "sh1106"):
+            self.controller = "auto"
         self.fd = os.open(dev_path, os.O_RDWR)
         try:
             fcntl.ioctl(self.fd, I2C_SLAVE, addr)
+            if self.controller == "auto":
+                self.controller = self.detect(self.fd)
+            self.column_offset = controller_column_offset(self.controller)
             self._commands(INIT_COMMANDS)
         except Exception:
             os.close(self.fd)
@@ -680,7 +767,15 @@ class SSD1306(object):
 
     def display(self, fb):
         for page in range(HEIGHT // 8):
-            self._commands([0xB0 + page, 0x00, 0x10])  # page, column 0
+            # Page address, then column address in low/high nibbles.
+            # The start column is self.column_offset: 0 on an SSD1306,
+            # 2 on an SH1106 (its RAM is 132 wide; the glass shows
+            # columns 2..129). clear() goes through display(), so
+            # it gets the offset too, and no stale garbage can be
+            # left in the unwritten edge columns.
+            self._commands([0xB0 + page,
+                            0x00 | (self.column_offset & 0x0F),
+                            0x10 | ((self.column_offset >> 4) & 0x0F)])
             self._data(fb[page * WIDTH:(page + 1) * WIDTH])
 
     def display_off(self):
@@ -1403,8 +1498,11 @@ def main(argv):
                 screensaver.blanked = False
                 screensaver.note_activity(now)
                 wake_pending = False
-                print("mfm-oled: display opened on %s at 0x%02x"
-                      % (I2C_DEV, I2C_ADDR), flush=True)
+                print("mfm-oled: display opened on %s at 0x%02x "
+                      "(controller %s, column offset %d)"
+                      % (I2C_DEV, I2C_ADDR, device.controller,
+                         device.column_offset),
+                      flush=True)
             except Exception as exc:  # display absent/unplugged: keep trying
                 print("mfm-oled: cannot open display: %s" % exc, flush=True)
                 if once:
